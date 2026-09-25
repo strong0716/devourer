@@ -1080,7 +1080,7 @@ void UsbTransport::discover_endpoints() {
       const libusb_endpoint_descriptor *endpoint = &interface_desc->endpoint[j];
       uint8_t endPointAddr = endpoint->bEndpointAddress;
       const bool is_bulk = (endpoint->bmAttributes & 0b11) ==
-                           LIBUSB_ENDPOINT_TRANSFER_TYPE_BULK;
+                           LIBUSB_TRANSFER_TYPE_BULK;
       _logger->info("endpoint[{}]: addr=0x{:X} attrs=0x{:X} bulk={} in={}",
                     (int)j, (int)endPointAddr, (int)endpoint->bmAttributes,
                     is_bulk ? 1 : 0,

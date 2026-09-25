@@ -763,6 +763,13 @@ add_executable(duplex
 target_link_libraries(duplex PUBLIC devourer PRIVATE PkgConfig::libusb)
 target_include_directories(duplex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 
+# Optional same-host radio service used by OpenHD's experimental IPC backend.
+# It stays a separate process and does not link OpenHD code.
+add_executable(openhd-radio-service
+    examples/openhd-radio-service/main.cpp)
+target_link_libraries(openhd-radio-service
+    PRIVATE devourer PkgConfig::libusb Threads::Threads)
+
 # txpower — reference consumer of the runtime TX-power API
 # (IRadio::SetTxPowerOffsetQdb / SetTxPowerIndexOverride / GetTxPowerState /
 # GetThermalStatus): opens one adapter, steps the knobs from CLI args (no env

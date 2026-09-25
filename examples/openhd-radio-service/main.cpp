@@ -1,0 +1,932 @@
+#include <libusb-1.0/libusb.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "AdapterCaps.h"
+#include "ChannelFreq.h"
+#include "IRadio.h"
+#include "RxPacket.h"
+#include "SelectedChannel.h"
+#include "SignalStop.h"
+#include "UsbDeviceLock.h"
+#include "UsbOpen.h"
+#include "WiFiDriver.h"
+#include "logger.h"
+
+namespace {
+
+// Independent Devourer-side implementation of the byte contract documented
+// by OpenHD's RadioIpcProtocol.h. The GPL-2.0 service neither includes nor
+// links OpenHD source.
+constexpr std::uint32_t kMagic = 0x4f484452;  // "OHDR"
+constexpr std::uint16_t kVersion = 1;
+constexpr std::size_t kHeaderSize = 16;
+constexpr std::size_t kMaxPayload = 16384;
+constexpr std::size_t kMaxMessage = kHeaderSize + kMaxPayload;
+constexpr std::uint16_t kHello = 1;
+constexpr std::uint16_t kReady = 2;
+constexpr std::uint16_t kSetFixedRf = 3;
+constexpr std::uint16_t kSetTxPower = 4;
+constexpr std::uint16_t kTxPacket = 5;
+constexpr std::uint16_t kRxPacket = 6;
+constexpr std::uint16_t kResponse = 7;
+constexpr std::uint16_t kDeviceError = 8;
+constexpr std::uint16_t kStop = 9;
+constexpr std::uint16_t kTxError = 10;
+constexpr std::uint16_t kCapabilityFixedRf = 1U << 0;
+constexpr std::uint16_t kCapabilityTxPowerIndex = 1U << 1;
+constexpr std::uint8_t kRadiotapFcs = 0x10;
+constexpr std::uint8_t kRadiotapBadFcs = 0x40;
+
+struct Args {
+  std::string socket_path = "/run/openhd-radio.sock";
+  std::string trace_file;
+  std::uint16_t vid = 0;
+  std::uint16_t pid = 0;
+  int bus = -1;
+  std::string port;
+};
+
+struct Message {
+  std::uint16_t type = 0;
+  std::uint32_t sequence = 0;
+  const std::uint8_t* payload = nullptr;
+  std::size_t payload_size = 0;
+};
+
+void put_u8(std::vector<std::uint8_t>& out, std::uint8_t value) {
+  out.push_back(value);
+}
+
+void put_u16(std::vector<std::uint8_t>& out, std::uint16_t value) {
+  out.push_back(static_cast<std::uint8_t>(value >> 8));
+  out.push_back(static_cast<std::uint8_t>(value));
+}
+
+void put_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+  out.push_back(static_cast<std::uint8_t>(value >> 24));
+  out.push_back(static_cast<std::uint8_t>(value >> 16));
+  out.push_back(static_cast<std::uint8_t>(value >> 8));
+  out.push_back(static_cast<std::uint8_t>(value));
+}
+
+void put_i32(std::vector<std::uint8_t>& out, std::int32_t value) {
+  put_u32(out, static_cast<std::uint32_t>(value));
+}
+
+bool get_u16(const std::uint8_t* data, std::size_t size,
+             std::size_t& offset, std::uint16_t& value) {
+  if (!data || offset > size || size - offset < 2) return false;
+  value = static_cast<std::uint16_t>((data[offset] << 8) | data[offset + 1]);
+  offset += 2;
+  return true;
+}
+
+bool get_u32(const std::uint8_t* data, std::size_t size,
+             std::size_t& offset, std::uint32_t& value) {
+  if (!data || offset > size || size - offset < 4) return false;
+  value = (static_cast<std::uint32_t>(data[offset]) << 24) |
+          (static_cast<std::uint32_t>(data[offset + 1]) << 16) |
+          (static_cast<std::uint32_t>(data[offset + 2]) << 8) |
+          static_cast<std::uint32_t>(data[offset + 3]);
+  offset += 4;
+  return true;
+}
+
+std::vector<std::uint8_t> encode(std::uint16_t type, std::uint32_t sequence,
+                                 const std::uint8_t* payload,
+                                 std::size_t payload_size) {
+  if (payload_size > kMaxPayload || (payload_size && !payload)) return {};
+  std::vector<std::uint8_t> out;
+  out.reserve(kHeaderSize + payload_size);
+  put_u32(out, kMagic);
+  put_u16(out, kVersion);
+  put_u16(out, type);
+  put_u32(out, sequence);
+  put_u32(out, static_cast<std::uint32_t>(payload_size));
+  if (payload_size) out.insert(out.end(), payload, payload + payload_size);
+  return out;
+}
+
+bool decode(const std::uint8_t* data, std::size_t size, Message& message) {
+  if (!data || size < kHeaderSize || size > kMaxMessage) return false;
+  std::size_t offset = 0;
+  std::uint32_t magic = 0;
+  std::uint16_t version = 0;
+  std::uint32_t payload_size = 0;
+  if (!get_u32(data, size, offset, magic) ||
+      !get_u16(data, size, offset, version) ||
+      !get_u16(data, size, offset, message.type) ||
+      !get_u32(data, size, offset, message.sequence) ||
+      !get_u32(data, size, offset, payload_size) || magic != kMagic ||
+      version != kVersion || payload_size != size - kHeaderSize ||
+      payload_size > kMaxPayload) {
+    return false;
+  }
+  message.payload = data + kHeaderSize;
+  message.payload_size = payload_size;
+  return true;
+}
+
+bool parse_number(const char* text, unsigned long& value) {
+  if (!text || !*text) return false;
+  char* end = nullptr;
+  errno = 0;
+  value = std::strtoul(text, &end, 0);
+  return errno == 0 && end != text && *end == '\0';
+}
+
+bool parse_args(int argc, char** argv, Args& args) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string key = argv[i];
+    if (i + 1 >= argc) return false;
+    const char* value = argv[++i];
+    if (key == "--socket") {
+      args.socket_path = value;
+    } else if (key == "--trace-file") {
+      args.trace_file = value;
+    } else if (key == "--vid") {
+      unsigned long parsed = 0;
+      if (!parse_number(value, parsed) || parsed > 0xffff) return false;
+      args.vid = static_cast<std::uint16_t>(parsed);
+    } else if (key == "--pid") {
+      unsigned long parsed = 0;
+      if (!parse_number(value, parsed) || parsed > 0xffff) return false;
+      args.pid = static_cast<std::uint16_t>(parsed);
+    } else if (key == "--bus") {
+      unsigned long parsed = 0;
+      if (!parse_number(value, parsed) || parsed > 255) return false;
+      args.bus = static_cast<int>(parsed);
+    } else if (key == "--port") {
+      args.port = value;
+    } else {
+      std::fprintf(stderr, "unknown argument: %s\n", key.c_str());
+      return false;
+    }
+  }
+  return !args.socket_path.empty() && args.vid != 0 && args.pid != 0 &&
+         args.bus >= 0 && !args.port.empty();
+}
+
+std::string usb_port_path(libusb_device* device) {
+  std::array<std::uint8_t, 8> ports{};
+  const int count = libusb_get_port_numbers(device, ports.data(), ports.size());
+  if (count <= 0) return {};
+  std::string path;
+  for (int i = 0; i < count; ++i) {
+    if (!path.empty()) path.push_back('.');
+    path += std::to_string(ports[i]);
+  }
+  return path;
+}
+
+libusb_device_handle* open_device(libusb_context* context, const Args& args,
+                                  const Logger_t& logger) {
+  libusb_device** devices = nullptr;
+  const ssize_t count = libusb_get_device_list(context, &devices);
+  if (count < 0) return nullptr;
+  libusb_device_handle* handle = nullptr;
+  for (ssize_t i = 0; i < count && handle == nullptr; ++i) {
+    libusb_device_descriptor descriptor{};
+    if (libusb_get_device_descriptor(devices[i], &descriptor) != 0 ||
+        descriptor.idVendor != args.vid || descriptor.idProduct != args.pid ||
+        libusb_get_bus_number(devices[i]) != args.bus ||
+        usb_port_path(devices[i]) != args.port) {
+      continue;
+    }
+    if (libusb_open(devices[i], &handle) == 0) {
+      logger->info("opened {:04x}:{:04x} bus={} port={}", args.vid, args.pid,
+                   args.bus, args.port);
+    }
+  }
+  libusb_free_device_list(devices, 1);
+  return handle;
+}
+
+class RadioSession {
+ public:
+  explicit RadioSession(Logger_t logger) : m_logger(std::move(logger)) {}
+  ~RadioSession() { close(); }
+
+  RadioSession(const RadioSession&) = delete;
+  RadioSession& operator=(const RadioSession&) = delete;
+
+  bool open(const Args& args, std::string& error) {
+    if (libusb_init(&m_context) != 0) {
+      m_logger->error("libusb_init failed");
+      error = "libusb_init failed";
+      return false;
+    }
+    m_handle = open_device(m_context, args, m_logger);
+    if (!m_handle) {
+      m_logger->error("no USB device matched the requested VID/PID/topology");
+      error = "no USB device matched the requested VID/PID/topology";
+      return false;
+    }
+    m_interface = devourer::find_wifi_interface(m_handle);
+    const int attached = libusb_kernel_driver_active(m_handle, m_interface);
+    if (attached == 1) {
+      m_kernel_driver_was_attached = true;
+    } else if (attached < 0 && attached != LIBUSB_ERROR_NOT_SUPPORTED) {
+      m_logger->error("cannot determine kernel driver state: {}", attached);
+      error = "cannot determine kernel driver state: " +
+              std::to_string(attached);
+      return false;
+    }
+
+    const int claim = devourer::claim_interface_reset_reopen(
+        m_context, m_handle, m_logger, true, m_usb_lock, {}, 10000);
+    if (claim != 0 || !m_handle) {
+      m_logger->error("Devourer could not claim/reset the USB interface: {}",
+                      claim);
+      error = "Devourer could not claim/reset the USB interface: " +
+              std::to_string(claim);
+      return false;
+    }
+    m_interface = devourer::find_wifi_interface(m_handle);
+    m_interface_claimed = true;
+
+    devourer::DeviceConfig config;
+    config.rx.enable_with_tx = true;
+    // Match OpenHD's rtl8812au monitor injector. Radiotap NOACK still clears
+    // retry count per frame; other frames use the OpenHD driver's 32 retries
+    // with rate fallback disabled.
+    config.tx.retry_limit = 32;
+    config.tx.retry_fallback = devourer::RetryFallback::Off;
+    WiFiDriver driver(m_logger);
+    m_radio = driver.CreateRadio(m_handle, m_context, m_usb_lock, config);
+    if (!m_radio) {
+      m_logger->error("Devourer did not recognize a supported radio");
+      error = "Devourer did not recognize a supported radio";
+      return false;
+    }
+    m_caps = m_radio->GetAdapterCaps();
+    if (!m_caps.supported ||
+        m_caps.generation != devourer::ChipGeneration::Jaguar1) {
+      m_logger->error("prototype accepts Jaguar1 only; detected {}",
+                      m_caps.chip_name ? m_caps.chip_name : "unknown");
+      error = "prototype accepts Jaguar1 only; detected " +
+              std::string(m_caps.chip_name ? m_caps.chip_name : "unknown");
+      return false;
+    }
+    m_logger->info("radio ready: chip={} generation={} bus={} port={}",
+                   m_caps.chip_name, devourer::generation_name(m_caps.generation),
+                   args.bus, args.port);
+    return true;
+  }
+
+  bool set_fixed_rf(std::uint32_t frequency_mhz, std::uint32_t width_mhz,
+                    std::string& error) {
+    if (!m_radio || frequency_mhz > 0xffff ||
+        (width_mhz != 20 && width_mhz != 40)) {
+      error = "prototype accepts fixed 20/40 MHz RF profiles only";
+      return false;
+    }
+    const int channel = devourer::freq_to_chan(
+        static_cast<std::uint16_t>(frequency_mhz));
+    if (channel <= 0 || channel > 255) {
+      error = "frequency is outside the Devourer channel mapping";
+      return false;
+    }
+    const SelectedChannel selected{
+        .Channel = static_cast<std::uint8_t>(channel),
+        .ChannelOffset = 0,
+        .ChannelWidth = width_mhz == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20};
+    try {
+      if (!m_initialized) {
+        m_radio->InitWrite(selected);
+        m_initialized = true;
+        m_rx_running = true;
+        m_rx_thread = std::thread([this] {
+          m_radio->StartRxLoop([this](const Packet& packet) {
+            on_rx_packet(packet);
+          });
+          m_rx_running = false;
+        });
+      } else {
+        m_radio->SetMonitorChannel(selected);
+      }
+    } catch (const std::exception& exception) {
+      error = exception.what();
+      return false;
+    } catch (...) {
+      error = "Devourer RF operation failed with an unknown exception";
+      return false;
+    }
+    m_frequency_mhz = frequency_mhz;
+    m_width_mhz = width_mhz;
+    return true;
+  }
+
+  bool set_tx_power(std::int32_t openhd_index, std::string& error) {
+    if (!m_radio || !m_caps.txpwr.supported || openhd_index < 0 ||
+        openhd_index > 63) {
+      error = "RTL8812AU TX power index must be in the range 0..63";
+      return false;
+    }
+    // OpenHD uses 0 for the calibrated default; Devourer uses -1 to clear its
+    // absolute flat TXAGC override.
+    m_radio->SetTxPowerIndexOverride(openhd_index == 0 ? -1 : openhd_index);
+    return true;
+  }
+
+  bool send_packet(const std::uint8_t* data, std::size_t length) {
+    return m_radio && m_initialized && data && length &&
+           m_radio->send_packet(data, length);
+  }
+
+  void set_identity(const Args& args) {
+    m_vid = args.vid;
+    m_pid = args.pid;
+    m_bus = args.bus;
+    m_port = args.port;
+  }
+  std::uint16_t vid() const { return m_vid; }
+  std::uint16_t pid() const { return m_pid; }
+  int bus() const { return m_bus; }
+  const std::string& port() const { return m_port; }
+  const devourer::AdapterCaps& caps() const { return m_caps; }
+
+  void set_rx_callback(std::function<void(const Packet&)> callback) {
+    m_rx_callback = std::move(callback);
+  }
+
+  void close() {
+    stop_rx();
+    m_radio.reset();  // quiesce USB TX while handle and context remain valid
+    if (m_handle) {
+      if (m_interface_claimed) {
+        const int release = libusb_release_interface(m_handle, m_interface);
+        if (release != 0)
+          m_logger->warn("libusb_release_interface returned {}", release);
+        m_interface_claimed = false;
+      }
+      if (m_kernel_driver_was_attached) {
+        const int active = libusb_kernel_driver_active(m_handle, m_interface);
+        if (active == 0) {
+          const int attach = libusb_attach_kernel_driver(m_handle, m_interface);
+          if (attach != 0 && attach != LIBUSB_ERROR_NOT_FOUND)
+            m_logger->error("failed to reattach original kernel driver: {}", attach);
+        }
+      }
+      libusb_close(m_handle);
+      m_handle = nullptr;
+    }
+    m_usb_lock.reset();
+    if (m_context) {
+      libusb_exit(m_context);
+      m_context = nullptr;
+    }
+    m_initialized = false;
+  }
+
+ private:
+  void stop_rx() {
+    if (m_radio && m_rx_running.load()) m_radio->StopRxLoop();
+    if (m_rx_thread.joinable()) m_rx_thread.join();
+    m_rx_running = false;
+  }
+
+  void on_rx_packet(const Packet& packet) {
+    if (m_rx_callback &&
+        packet.RxAtrib.pkt_rpt_type == RX_PACKET_TYPE::NORMAL_RX &&
+        !packet.Data.empty() && packet.Data.size() + 1 <= kMaxPayload) {
+      m_rx_callback(packet);
+    }
+  }
+
+  Logger_t m_logger;
+  libusb_context* m_context = nullptr;
+  libusb_device_handle* m_handle = nullptr;
+  int m_interface = 0;
+  bool m_kernel_driver_was_attached = false;
+  bool m_interface_claimed = false;
+  bool m_initialized = false;
+  std::atomic<bool> m_rx_running{false};
+  std::thread m_rx_thread;
+  std::shared_ptr<devourer::UsbDeviceLock> m_usb_lock;
+  std::unique_ptr<IRadio> m_radio;
+  devourer::AdapterCaps m_caps{};
+  std::function<void(const Packet&)> m_rx_callback;
+  std::uint16_t m_vid = 0;
+  std::uint16_t m_pid = 0;
+  int m_bus = 0;
+  std::string m_port;
+  std::uint32_t m_frequency_mhz = 0;
+  std::uint32_t m_width_mhz = 0;
+};
+
+class Service {
+ public:
+  Service(Args args, Logger_t logger)
+      : m_args(std::move(args)), m_logger(std::move(logger)) {}
+  ~Service() {
+    if (m_listener >= 0) ::close(m_listener);
+    if (m_bound_socket) ::unlink(m_args.socket_path.c_str());
+  }
+
+  int run() {
+    if (!listen_socket()) return 2;
+    m_logger->info("listening at {} for {:04x}:{:04x} bus={} port={}",
+                   m_args.socket_path, m_args.vid, m_args.pid, m_args.bus,
+                   m_args.port);
+    while (!g_devourer_should_stop) {
+      pollfd descriptor{m_listener, POLLIN, 0};
+      const int ready = ::poll(&descriptor, 1, 250);
+      if (ready < 0) {
+        if (errno == EINTR) continue;
+        m_logger->error("listener poll failed: {}", errno);
+        return 2;
+      }
+      if (ready == 0) continue;
+      const int client = ::accept4(m_listener, nullptr, nullptr, SOCK_CLOEXEC);
+      if (client < 0) {
+        if (errno == EINTR || errno == EAGAIN) continue;
+        m_logger->error("accept failed: {}", errno);
+        continue;
+      }
+      timeval send_timeout{1, 0};
+      (void)::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &send_timeout,
+                         sizeof(send_timeout));
+      m_logger->info("OpenHD client connected");
+      serve_client(client);
+      ::close(client);
+      m_logger->info("OpenHD client disconnected; USB session released");
+    }
+    return 0;
+  }
+
+ private:
+  bool listen_socket() {
+    sockaddr_un address{};
+    if (m_args.socket_path.size() >= sizeof(address.sun_path)) {
+      m_logger->error("socket path is too long");
+      return false;
+    }
+    struct stat existing {};
+    if (::lstat(m_args.socket_path.c_str(), &existing) == 0) {
+      if (!S_ISSOCK(existing.st_mode)) {
+        m_logger->error("refusing to unlink a non-socket path: {}",
+                        m_args.socket_path);
+        return false;
+      }
+      const int probe = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+      if (probe < 0) {
+        m_logger->error("cannot check existing radio socket: {}", errno);
+        return false;
+      }
+      sockaddr_un probe_address{};
+      probe_address.sun_family = AF_UNIX;
+      std::memcpy(probe_address.sun_path, m_args.socket_path.c_str(),
+                  m_args.socket_path.size() + 1);
+      const int probe_result = ::connect(
+          probe, reinterpret_cast<const sockaddr*>(&probe_address),
+          sizeof(probe_address));
+      const int probe_error = errno;
+      ::close(probe);
+      if (probe_result == 0) {
+        m_logger->error("a radio service is already listening at {}",
+                        m_args.socket_path);
+        return false;
+      }
+      if (probe_error != ECONNREFUSED && probe_error != ENOENT) {
+        m_logger->error("existing radio socket cannot be probed: {}",
+                        probe_error);
+        return false;
+      }
+      if (::unlink(m_args.socket_path.c_str()) != 0) {
+        m_logger->error("cannot remove stale radio socket: {}", errno);
+        return false;
+      }
+    } else if (errno != ENOENT) {
+      m_logger->error("cannot inspect radio socket path: {}", errno);
+      return false;
+    }
+    m_listener = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (m_listener < 0) {
+      m_logger->error("cannot create Unix socket: {}", errno);
+      return false;
+    }
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, m_args.socket_path.c_str(),
+                m_args.socket_path.size() + 1);
+    if (::bind(m_listener, reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) != 0 ||
+        ::chmod(m_args.socket_path.c_str(), 0660) != 0 ||
+        ::listen(m_listener, 1) != 0) {
+      m_logger->error("cannot bind/listen at {}: {}", m_args.socket_path,
+                      errno);
+      return false;
+    }
+    m_bound_socket = true;
+    return true;
+  }
+
+  bool send_message(int fd, std::mutex& send_mutex, std::uint16_t type,
+                    std::uint32_t sequence, const std::uint8_t* payload,
+                    std::size_t payload_size, bool nonblocking = false) {
+    const auto packet = encode(type, sequence, payload, payload_size);
+    if (packet.empty()) return false;
+    std::lock_guard<std::mutex> lock(send_mutex);
+    const int flags = MSG_NOSIGNAL | (nonblocking ? MSG_DONTWAIT : 0);
+    const ssize_t sent = ::send(fd, packet.data(), packet.size(), flags);
+    return sent == static_cast<ssize_t>(packet.size());
+  }
+
+  bool send_response(int fd, std::mutex& send_mutex, std::uint32_t sequence,
+                     std::uint16_t request_type, std::uint16_t result_code,
+                     int native_error, const std::string& detail,
+                     bool readback_verified = false) {
+    const auto text_size = std::min<std::size_t>(detail.size(), 512);
+    std::vector<std::uint8_t> payload;
+    put_u16(payload, request_type);
+    put_u16(payload, result_code);
+    put_i32(payload, native_error);
+    put_u8(payload, readback_verified ? 1 : 0);
+    put_u8(payload, 0);
+    put_u16(payload, static_cast<std::uint16_t>(text_size));
+    payload.insert(payload.end(), detail.begin(), detail.begin() + text_size);
+    return send_message(fd, send_mutex, kResponse, sequence, payload.data(),
+                        payload.size());
+  }
+
+  bool send_ready(int fd, std::mutex& send_mutex, std::uint32_t sequence,
+                  const RadioSession& session) {
+    std::vector<std::uint8_t> payload;
+    put_u16(payload, session.vid());
+    put_u16(payload, session.pid());
+    put_u8(payload, static_cast<std::uint8_t>(session.bus()));
+    put_u8(payload, static_cast<std::uint8_t>(session.port().size()));
+    payload.insert(payload.end(), session.port().begin(), session.port().end());
+    put_u8(payload, 0);  // EFUSE MAC omitted until a reliable API is available
+    const char* model = session.caps().marketing_names;
+    if (!model || !*model) model = session.caps().chip_name;
+    const std::string model_text = model ? model : "RTL8812AU";
+    const std::string chip_text =
+        session.caps().chip_name ? session.caps().chip_name : "RTL8812AU";
+    put_u8(payload, static_cast<std::uint8_t>(model_text.size()));
+    payload.insert(payload.end(), model_text.begin(), model_text.end());
+    put_u8(payload, static_cast<std::uint8_t>(chip_text.size()));
+    payload.insert(payload.end(), chip_text.begin(), chip_text.end());
+    std::uint16_t capabilities = kCapabilityFixedRf;
+    if (session.caps().txpwr.supported)
+      capabilities |= kCapabilityTxPowerIndex;
+    put_u16(payload, capabilities);
+    return send_message(fd, send_mutex, kReady, sequence, payload.data(),
+                        payload.size());
+  }
+
+  bool receive_message(int fd, std::array<std::uint8_t, kMaxMessage>& buffer,
+                       Message& message) {
+    const ssize_t received = ::recv(fd, buffer.data(), buffer.size(), 0);
+    if (received <= 0) return false;
+    return decode(buffer.data(), static_cast<std::size_t>(received), message);
+  }
+
+  void serve_client(int client) {
+    std::mutex send_mutex;
+    std::array<std::uint8_t, kMaxMessage> buffer{};
+    Message message;
+    if (!receive_message(client, buffer, message) || message.type != kHello ||
+        message.sequence != 1 || message.payload_size != 0) {
+      m_logger->warn("client sent an invalid IPC handshake");
+      return;
+    }
+
+    RadioSession session(m_logger);
+    session.set_identity(m_args);
+    std::string open_error;
+    if (!session.open(m_args, open_error)) {
+      const std::string detail = open_error.empty()
+                                     ? "failed to claim or initialize the selected USB radio"
+                                     : open_error;
+      (void)send_message(client, send_mutex, kDeviceError, 0,
+                         reinterpret_cast<const std::uint8_t*>(detail.data()),
+                         detail.size());
+      return;
+    }
+    session.set_rx_callback([&](const Packet& packet) {
+      std::vector<std::uint8_t> payload;
+      payload.reserve(packet.Data.size() + 1);
+      std::uint8_t flags = packet.RxAtrib.fcs_present ? kRadiotapFcs : 0;
+      if (packet.RxAtrib.crc_err) flags |= kRadiotapBadFcs;
+      put_u8(payload, flags);
+      payload.insert(payload.end(), packet.Data.begin(), packet.Data.end());
+      const auto rx_sequence = m_rx_sequence++;
+      const bool forwarded = send_message(
+          client, send_mutex, kRxPacket, rx_sequence, payload.data(),
+          payload.size(), true);
+      record_trace_rx(packet, rx_sequence);
+      record_rx(packet, forwarded);
+    });
+    if (!send_ready(client, send_mutex, message.sequence, session)) {
+      m_logger->warn("failed to send Devourer radio identity");
+      return;
+    }
+
+    while (!g_devourer_should_stop) {
+      pollfd descriptor{client, POLLIN, 0};
+      const int ready = ::poll(&descriptor, 1, 250);
+      if (ready < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      if (ready == 0) continue;
+      if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) break;
+      if (!receive_message(client, buffer, message)) break;
+      std::size_t offset = 0;
+      std::string detail;
+      if (message.type == kSetFixedRf && message.payload_size == 8) {
+        std::uint32_t frequency = 0;
+        std::uint32_t width = 0;
+        const bool decoded = get_u32(message.payload, message.payload_size,
+                                     offset, frequency) &&
+                             get_u32(message.payload, message.payload_size,
+                                     offset, width);
+        const bool applied = decoded &&
+                             session.set_fixed_rf(frequency, width, detail);
+        (void)send_response(client, send_mutex, message.sequence, message.type,
+                            applied ? 0 : 5, applied ? 0 : EINVAL,
+                            applied ? "fixed RF profile applied" : detail);
+      } else if (message.type == kSetTxPower &&
+                 message.payload_size == 5) {
+        std::uint32_t raw_power = 0;
+        if (!get_u32(message.payload, message.payload_size, offset, raw_power)) {
+          break;
+        }
+        const auto power = static_cast<std::int32_t>(raw_power);
+        const bool applied = session.set_tx_power(power, detail);
+        (void)send_response(client, send_mutex, message.sequence, message.type,
+                            applied ? 0 : 5, applied ? 0 : EINVAL,
+                            applied ? "TX power index applied" : detail);
+      } else if (message.type == kTxPacket &&
+                 message.payload_size > sizeof(std::uint32_t)) {
+        std::uint32_t tx_sequence = 0;
+        if (!get_u32(message.payload, message.payload_size, offset,
+                     tx_sequence)) {
+          break;
+        }
+        const auto* tx_data = message.payload + offset;
+        const auto tx_length = message.payload_size - offset;
+        record_trace("TX", tx_sequence, tx_data, tx_length, "");
+        log_tx_prefix(tx_data, tx_length, tx_sequence);
+        const bool submitted = session.send_packet(tx_data, tx_length);
+        {
+          std::lock_guard<std::mutex> lock(m_stats_mutex);
+          ++m_tx_attempted;
+          if (submitted) {
+            ++m_tx_submitted;
+          } else {
+            ++m_tx_rejected;
+          }
+        }
+        if (!submitted) {
+          const std::string error = "Devourer rejected TX sequence " +
+                                    std::to_string(tx_sequence);
+          (void)send_message(client, send_mutex, kTxError, message.sequence,
+                             reinterpret_cast<const std::uint8_t*>(error.data()),
+                             error.size(), true);
+        }
+      } else if (message.type == kStop && message.payload_size == 0) {
+        (void)send_response(client, send_mutex, message.sequence, message.type,
+                            0, 0, "radio session stopped");
+        break;
+      } else {
+        detail = "unsupported or malformed radio IPC request";
+        (void)send_response(client, send_mutex, message.sequence, message.type,
+                            5, EPROTO, detail);
+      }
+    }
+    session.close();
+    log_session_stats();
+    write_trace_records();
+  }
+
+  struct TraceRecord {
+    const char* direction = "";
+    std::uint32_t sequence = 0;
+    std::uint64_t monotonic_ns = 0;
+    std::string metadata;
+    std::vector<std::uint8_t> bytes;
+  };
+
+  void record_trace(const char* direction, std::uint32_t sequence,
+                    const std::uint8_t* data, std::size_t length,
+                    std::string metadata) {
+    constexpr std::size_t kMaxTraceRecords = 512;
+    constexpr std::size_t kMaxTraceBytes = 2 * 1024 * 1024;
+    if (m_args.trace_file.empty() || !data || length == 0) return;
+    std::lock_guard<std::mutex> lock(m_trace_mutex);
+    if (m_trace_records.size() >= kMaxTraceRecords ||
+        length > kMaxTraceBytes - m_trace_bytes) {
+      ++m_trace_dropped;
+      return;
+    }
+    TraceRecord record;
+    record.direction = direction;
+    record.sequence = sequence;
+    record.monotonic_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    record.metadata = std::move(metadata);
+    record.bytes.assign(data, data + length);
+    m_trace_bytes += length;
+    m_trace_records.emplace_back(std::move(record));
+  }
+
+  void record_trace_rx(const Packet& packet, std::uint32_t sequence) {
+    const std::string metadata =
+        "fcs_present=" + std::to_string(packet.RxAtrib.fcs_present) +
+        " crc_err=" + std::to_string(packet.RxAtrib.crc_err) +
+        " phy_status=" + std::to_string(packet.RxAtrib.physt) +
+        " report_type=" +
+        std::to_string(static_cast<unsigned>(packet.RxAtrib.pkt_rpt_type));
+    record_trace("RX", sequence, packet.Data.data(), packet.Data.size(),
+                 metadata);
+  }
+
+  void write_trace_records() {
+    if (m_args.trace_file.empty()) return;
+    std::vector<TraceRecord> records;
+    std::size_t dropped = 0;
+    {
+      std::lock_guard<std::mutex> lock(m_trace_mutex);
+      records.swap(m_trace_records);
+      dropped = m_trace_dropped;
+      m_trace_bytes = 0;
+      m_trace_dropped = 0;
+    }
+    if (records.empty() && dropped == 0) return;
+    std::ofstream trace(m_args.trace_file, std::ios::out | std::ios::app);
+    if (!trace) {
+      m_logger->warn("cannot append packet trace to {}", m_args.trace_file);
+      return;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (const auto& record : records) {
+      trace << record.direction << " seq=" << record.sequence
+            << " monotonic_ns=" << record.monotonic_ns
+            << " len=" << record.bytes.size();
+      if (!record.metadata.empty()) trace << ' ' << record.metadata;
+      trace << " hex=";
+      for (const auto byte : record.bytes) {
+        trace << kHex[byte >> 4] << kHex[byte & 0x0f];
+      }
+      trace << '\n';
+    }
+    trace << "TRACE_SUMMARY records=" << records.size()
+          << " dropped=" << dropped << '\n';
+    m_logger->info("wrote {} packet trace records to {} (dropped={})",
+                   records.size(), m_args.trace_file, dropped);
+  }
+
+  void record_rx(const Packet& packet, bool forwarded) {
+    std::string source = "short-frame";
+    if (packet.Data.size() >= 16) {
+      char address[18]{};
+      std::snprintf(address, sizeof(address),
+                    "%02x:%02x:%02x:%02x:%02x:%02x", packet.Data[10],
+                    packet.Data[11], packet.Data[12], packet.Data[13],
+                    packet.Data[14], packet.Data[15]);
+      source = address;
+    }
+    std::lock_guard<std::mutex> lock(m_stats_mutex);
+    if (forwarded) {
+      ++m_rx_forwarded;
+    } else {
+      ++m_rx_dropped;
+    }
+    if (packet.RxAtrib.crc_err) ++m_rx_bad_fcs;
+    if (packet.RxAtrib.physt) ++m_rx_with_phy_status;
+    ++m_rx_source_counts[source];
+  }
+
+  void log_tx_prefix(const std::uint8_t* data, std::size_t length,
+                     std::uint32_t sequence) {
+    if (!data || m_tx_logged >= 8) return;
+    const auto prefix_length = std::min<std::size_t>(length, 64);
+    char prefix[64 * 2 + 1]{};
+    for (std::size_t i = 0; i < prefix_length; ++i) {
+      std::snprintf(prefix + i * 2, 3, "%02x", data[i]);
+    }
+    const auto radiotap_length =
+        length >= 4 ? static_cast<std::size_t>(data[2] | (data[3] << 8)) : 0;
+    m_logger->info(
+        "OpenHD TX request #{} len={} radiotap_len={} prefix64={}",
+        sequence, length, radiotap_length, prefix);
+    ++m_tx_logged;
+  }
+
+  void log_session_stats() {
+    std::map<std::string, std::uint64_t> source_counts;
+    std::uint64_t tx_attempted = 0;
+    std::uint64_t tx_submitted = 0;
+    std::uint64_t tx_rejected = 0;
+    std::uint64_t rx_forwarded = 0;
+    std::uint64_t rx_dropped = 0;
+    std::uint64_t rx_bad_fcs = 0;
+    std::uint64_t rx_with_phy_status = 0;
+    {
+      std::lock_guard<std::mutex> lock(m_stats_mutex);
+      source_counts = m_rx_source_counts;
+      tx_attempted = m_tx_attempted;
+      tx_submitted = m_tx_submitted;
+      tx_rejected = m_tx_rejected;
+      rx_forwarded = m_rx_forwarded;
+      rx_dropped = m_rx_dropped;
+      rx_bad_fcs = m_rx_bad_fcs;
+      rx_with_phy_status = m_rx_with_phy_status;
+      m_rx_source_counts.clear();
+      m_tx_attempted = 0;
+      m_tx_submitted = 0;
+      m_tx_rejected = 0;
+      m_tx_logged = 0;
+      m_rx_forwarded = 0;
+      m_rx_dropped = 0;
+      m_rx_bad_fcs = 0;
+      m_rx_with_phy_status = 0;
+    }
+
+    m_logger->info(
+        "radio counters: TX attempted={} submit_ok={} submit_rejected={} "
+        "RX forwarded={} dropped={} bad_fcs={} phy_status_frames={}",
+        tx_attempted, tx_submitted, tx_rejected, rx_forwarded, rx_dropped,
+        rx_bad_fcs, rx_with_phy_status);
+    std::vector<std::pair<std::string, std::uint64_t>> ranked_sources(
+        source_counts.begin(), source_counts.end());
+    std::sort(ranked_sources.begin(), ranked_sources.end(),
+              [](const auto& left, const auto& right) {
+                if (left.second != right.second)
+                  return left.second > right.second;
+                return left.first < right.first;
+              });
+    std::ostringstream summary;
+    const auto limit = std::min<std::size_t>(ranked_sources.size(), 32);
+    for (std::size_t i = 0; i < limit; ++i) {
+      if (i) summary << ",";
+      summary << ranked_sources[i].first << ":" << ranked_sources[i].second;
+    }
+    m_logger->info("RX source addr2 top32={}", summary.str());
+  }
+
+  Args m_args;
+  Logger_t m_logger;
+  int m_listener = -1;
+  bool m_bound_socket = false;
+  std::uint32_t m_rx_sequence = 1;
+  std::mutex m_stats_mutex;
+  std::uint64_t m_tx_attempted = 0;
+  std::uint64_t m_tx_submitted = 0;
+  std::uint64_t m_tx_rejected = 0;
+  std::uint64_t m_tx_logged = 0;
+  std::uint64_t m_rx_forwarded = 0;
+  std::uint64_t m_rx_dropped = 0;
+  std::uint64_t m_rx_bad_fcs = 0;
+  std::uint64_t m_rx_with_phy_status = 0;
+  std::map<std::string, std::uint64_t> m_rx_source_counts;
+  std::mutex m_trace_mutex;
+  std::vector<TraceRecord> m_trace_records;
+  std::size_t m_trace_bytes = 0;
+  std::size_t m_trace_dropped = 0;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  Args args;
+  if (!parse_args(argc, argv, args)) {
+    std::fprintf(stderr,
+                 "usage: openhd-radio-service --socket PATH --vid N --pid N "
+                 "--bus N --port N[.N...] [--trace-file PATH]\n");
+    return 2;
+  }
+  auto logger = std::make_shared<Logger>();
+  install_devourer_signal_handlers();
+  Service service(std::move(args), logger);
+  return service.run();
+}
