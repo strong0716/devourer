@@ -1470,9 +1470,11 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
       _eepromManager->version_id.ICType == CHIP_8814A &&
       !_cfg.tx.legacy_8812_desc;
 
-  /* Single-fragment frame: LAST_SEG=1 (no FIRST_SEG). */
+  /* Match the OpenHD 8812A monitor descriptor: a single frame sets both
+   * FIRST_SEG and LAST_SEG. 8814A uses its separate descriptor convention. */
   SET_TX_DESC_LAST_SEG_8812(usb_frame, 1);
   if (!is_8814a) {
+    SET_TX_DESC_FIRST_SEG_8812(usb_frame, 1);
     /* OWN=1 needed on 8812/8821 so chip processes the descriptor. On
      * 8814A the same bit is DISQSELSEQ -- leave at 0 to match 88XXau. */
     SET_TX_DESC_OWN_8812(usb_frame, 1);
@@ -1491,22 +1493,43 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
    * match the kernel's. */
   SET_TX_DESC_MACID_8812(usb_frame, static_cast<uint8_t>(0x01));
 
-  if (!vht) {
-    rate_id = 8;
-  } else {
-    rate_id = 9;
+  /* The OpenHD rtl8812au monitor injector chooses RAID from the adapter RF
+   * path count under CONFIG_80211AC_VHT, even when the per-packet radiotap
+   * rate is HT-MCS. Mirror rtw_monitor_frame_attrib(): 1T1R -> VHT1SS (10),
+   * 2T2R/2T4R -> VHT2SS (9), 3T3R -> VHT3SS (13), otherwise BGN40M1SS (1).
+   * On the tested 2T2R RTL8812AU this makes the 153-byte WFB TX descriptor
+   * match the Kernel backend byte-for-byte. */
+  switch (_eepromManager->numTotalRfPath) {
+    case 1:
+      rate_id = 10;
+      break;
+    case 2:
+      rate_id = 9;
+      break;
+    case 3:
+      rate_id = 13;
+      break;
+    default:
+      rate_id = 1;
+      break;
   }
 
-  SET_TX_DESC_BMC_8812(usb_frame, 1);
+  const bool is_group_destination =
+      real_packet_length >= 10 &&
+      (packet[radiotap_length + 4] & 0x01) != 0;
+  if (is_group_destination)
+    SET_TX_DESC_BMC_8812(usb_frame, 1);
   SET_TX_DESC_RATE_ID_8812(usb_frame, static_cast<uint8_t>(rate_id));
 
+  /* OpenHD's rtl8812au monitor injector allocates every injected MPDU through
+   * monitor_alloc_mgtxmitframe(); update_monitor_frame_attrib() then assigns
+   * QSLT_MGNT (0x12), including frames whose 802.11 frame-control type is
+   * Data. Mirror that actual driver contract instead of choosing a queue from
+   * the MPDU type. */
   SET_TX_DESC_QUEUE_SEL_8812(usb_frame, 0x12);
   SET_TX_DESC_HWSEQ_EN_8812(usb_frame, static_cast<uint8_t>(1));
-  if (!is_8814a) {
-    /* 88XXau leaves GID=0 for monitor injection on 8814A. */
-    SET_TX_DESC_GID_8812(usb_frame, static_cast<uint8_t>(0x3F));
-  }
-  SET_TX_DESC_SW_DEFINE_8812(usb_frame, static_cast<uint16_t>(0x001));
+  /* The descriptor starts zeroed. OpenHD's monitor injection leaves GID and
+   * SW_DEFINE at zero; do not stamp a beamforming group onto ordinary WFB. */
   /* DEVOURER_TX_REPORT: SPE_RPT asks the fw for a CCX TX report (delivered /
    * retry count / queue time — src/TxReport.h), sampled every Nth frame
    * (cfg value = N). The 8812 report format has no tag echo, so sampling
@@ -1529,9 +1552,12 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
   if (!is_8814a) {
     /* 88XXau leaves DATA_RETRY_LIMIT=0 for monitor injection on 8814A
      * (RETRY_LIMIT_ENABLE stays set to 1 in both).
-     * Use cfg.tx.retry_limit (DEVOURER_TX_RETRY_LIMIT, default 0) instead of
-     * the hardcoded 12 — retries flood the air on a busy half-duplex link. */
-    SET_TX_DESC_DATA_RETRY_LIMIT_8812(usb_frame, _cfg.tx.retry_limit);
+     * Honor Radiotap NOACK exactly like OpenHD's monitor driver. Other frames
+     * use the configured limit (the OpenHD service selects 32 to match its
+     * kernel path; standalone Devourer retains its configured default). */
+    const bool no_ack = (txflags & 0x0008) != 0;
+    SET_TX_DESC_DATA_RETRY_LIMIT_8812(
+        usb_frame, no_ack ? 0 : _cfg.tx.retry_limit);
   }
   if (sgi) {
     _logger->info("short gi enabled,set sgi");
