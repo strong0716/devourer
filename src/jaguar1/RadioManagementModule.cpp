@@ -17,7 +17,14 @@ extern "C" {
 
 namespace {
 
-int get_40mhz_center_channel(int channel) {
+int get_40mhz_center_channel(int channel, uint8_t chnl_offset) {
+    /* Channel is the primary 20 MHz channel. The primary/secondary sideband
+     * selects which adjacent 20 MHz channel forms the 40 MHz center. */
+    if (chnl_offset == HAL_PRIME_CHNL_OFFSET_LOWER)
+        return channel + 2;
+    if (chnl_offset == HAL_PRIME_CHNL_OFFSET_UPPER)
+        return channel - 2;
+
     static const std::unordered_map<int, int> channel_map = {
         // 2.4GHz 40MHz configuration: only one valid center channel (6)
         {4, 6},  // primary below center (extension above)
@@ -240,7 +247,7 @@ static uint8_t rtw_get_center_ch(uint8_t channel, ChannelWidth_t chnl_bw,
     else if (channel <= 14)
       center_ch = 7;
   } else if (chnl_bw == ChannelWidth_t::CHANNEL_WIDTH_40) {
-      center_ch = get_40mhz_center_channel(center_ch);
+      center_ch = get_40mhz_center_channel(center_ch, chnl_offset);
   } else if (chnl_bw == ChannelWidth_t::CHANNEL_WIDTH_20 ||
              chnl_bw == ChannelWidth_t::CHANNEL_WIDTH_5 ||
              chnl_bw == ChannelWidth_t::CHANNEL_WIDTH_10) {

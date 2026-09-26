@@ -43,7 +43,7 @@ namespace {
 // by OpenHD's RadioIpcProtocol.h. The GPL-2.0 service neither includes nor
 // links OpenHD source.
 constexpr std::uint32_t kMagic = 0x4f484452;  // "OHDR"
-constexpr std::uint16_t kVersion = 1;
+constexpr std::uint16_t kVersion = 2;
 constexpr std::size_t kHeaderSize = 16;
 constexpr std::size_t kMaxPayload = 16384;
 constexpr std::size_t kMaxMessage = kHeaderSize + kMaxPayload;
@@ -59,6 +59,10 @@ constexpr std::uint16_t kStop = 9;
 constexpr std::uint16_t kTxError = 10;
 constexpr std::uint16_t kCapabilityFixedRf = 1U << 0;
 constexpr std::uint16_t kCapabilityTxPowerIndex = 1U << 1;
+// Values used by Devourer's SelectedChannel::ChannelOffset.
+constexpr std::uint8_t kPrimaryOffsetDontCare = 0;
+constexpr std::uint8_t kPrimaryOffsetLower = 1;
+constexpr std::uint8_t kPrimaryOffsetUpper = 2;
 constexpr std::uint8_t kRadiotapFcs = 0x10;
 constexpr std::uint8_t kRadiotapBadFcs = 0x40;
 
@@ -300,10 +304,20 @@ class RadioSession {
   }
 
   bool set_fixed_rf(std::uint32_t frequency_mhz, std::uint32_t width_mhz,
+                    std::uint8_t primary_channel_offset,
                     std::string& error) {
     if (!m_radio || frequency_mhz > 0xffff ||
         (width_mhz != 20 && width_mhz != 40)) {
       error = "prototype accepts fixed 20/40 MHz RF profiles only";
+      return false;
+    }
+    const bool valid_offset =
+        width_mhz == 20
+            ? primary_channel_offset == kPrimaryOffsetDontCare
+            : (primary_channel_offset == kPrimaryOffsetLower ||
+               primary_channel_offset == kPrimaryOffsetUpper);
+    if (!valid_offset) {
+      error = "40 MHz requires a valid primary-channel offset";
       return false;
     }
     const int channel = devourer::freq_to_chan(
@@ -314,7 +328,7 @@ class RadioSession {
     }
     const SelectedChannel selected{
         .Channel = static_cast<std::uint8_t>(channel),
-        .ChannelOffset = 0,
+        .ChannelOffset = primary_channel_offset,
         .ChannelWidth = width_mhz == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20};
     try {
       if (!m_initialized) {
@@ -660,15 +674,20 @@ class Service {
       if (!receive_message(client, buffer, message)) break;
       std::size_t offset = 0;
       std::string detail;
-      if (message.type == kSetFixedRf && message.payload_size == 8) {
+      if (message.type == kSetFixedRf && message.payload_size == 9) {
         std::uint32_t frequency = 0;
         std::uint32_t width = 0;
         const bool decoded = get_u32(message.payload, message.payload_size,
                                      offset, frequency) &&
                              get_u32(message.payload, message.payload_size,
-                                     offset, width);
+                                     offset, width) &&
+                             offset < message.payload_size;
+        const std::uint8_t primary_channel_offset =
+            decoded ? message.payload[offset] : 0;
         const bool applied = decoded &&
-                             session.set_fixed_rf(frequency, width, detail);
+                             session.set_fixed_rf(frequency, width,
+                                                  primary_channel_offset,
+                                                  detail);
         (void)send_response(client, send_mutex, message.sequence, message.type,
                             applied ? 0 : 5, applied ? 0 : EINVAL,
                             applied ? "fixed RF profile applied" : detail);
