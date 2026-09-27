@@ -747,6 +747,7 @@ class Service {
   ~Service() {
     if (m_listener >= 0) ::close(m_listener);
     if (m_bound_socket) ::unlink(m_args.socket_path.c_str());
+    if (m_radio_access_attempted) restore_kernel_binding();
   }
 
   int run() {
@@ -781,6 +782,33 @@ class Service {
   }
 
  private:
+  void restore_kernel_binding() {
+    // A previous service process may have been killed after detaching the
+    // kernel driver. The replacement session then cannot know that the driver
+    // was originally attached. Restore it only as this service exits, rather
+    // than between OpenHD client sessions during automatic recovery.
+    libusb_context* context = nullptr;
+    if (libusb_init(&context) != 0) return;
+    libusb_device_handle* handle = open_device(context, m_args, m_logger);
+    if (handle) {
+      const int iface = devourer::find_wifi_interface(handle);
+      const int active = libusb_kernel_driver_active(handle, iface);
+      if (active == 0) {
+        const int rc = libusb_attach_kernel_driver(handle, iface);
+        if (rc == 0)
+          m_logger->info("restored kernel driver on USB interface {}", iface);
+        else if (rc != LIBUSB_ERROR_NOT_FOUND)
+          m_logger->warn("kernel driver reattach failed on interface {}: {}",
+                         iface, rc);
+      } else if (active < 0 && active != LIBUSB_ERROR_NOT_SUPPORTED) {
+        m_logger->warn("cannot check kernel driver on interface {}: {}",
+                       iface, active);
+      }
+      libusb_close(handle);
+    }
+    libusb_exit(context);
+  }
+
   bool listen_socket() {
     sockaddr_un address{};
     if (m_args.socket_path.size() >= sizeof(address.sun_path)) {
@@ -926,6 +954,7 @@ class Service {
 
     RadioSession session(m_logger);
     session.set_identity(m_args);
+    m_radio_access_attempted = true;
     std::string open_error;
     if (!session.open(m_args, open_error)) {
       const std::string detail = open_error.empty()
@@ -1285,6 +1314,7 @@ class Service {
   Logger_t m_logger;
   int m_listener = -1;
   bool m_bound_socket = false;
+  bool m_radio_access_attempted = false;
   std::uint32_t m_rx_sequence = 1;
   std::mutex m_stats_mutex;
   std::uint64_t m_tx_attempted = 0;
