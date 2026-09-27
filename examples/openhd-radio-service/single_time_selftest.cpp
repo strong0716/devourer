@@ -107,5 +107,53 @@ int main() {
   assert(!fixed.can_tx(4000000U, false, 1000U));
   fixed.stop();
   assert(!fixed.can_tx(4000000U, true, 1000U));
+
+  // All four selectable modes accept the same plan shape with only the
+  // FHSS/TDMA flags and frequency count changed. An unsupported combination
+  // must be rejected before USB TX, not silently downgraded.
+  for (const bool fhss : {false, true}) {
+    for (const bool tdma : {false, true}) {
+      auto mode = plan;
+      mode.flags = openhd_single_time::kGroundFlag |
+                   (fhss ? openhd_single_time::kFhssFlag : 0) |
+                   (tdma ? openhd_single_time::kTdmaFlag : 0);
+      mode.channel_count = fhss ? 2 : 1;
+      mode.own_id = 1;
+      assert(openhd_single_time::valid(mode));
+      Scheduler executor;
+      assert(executor.configure(mode, mode.frequencies_mhz[0]));
+      if (fhss || tdma)
+        assert(executor.set_phase(1000000U, 1000000U, 0U));
+      if (tdma)
+        assert(executor.set_members(1000000U, members));
+      assert(executor.can_tx(1004000U, true, 1000U));
+      assert(executor.can_tx(1004000U, false, 1000U));
+    }
+  }
+
+  // Reject malformed plans at the executor boundary, including combinations
+  // that could otherwise look like a valid fixed-frequency fallback.
+  auto invalid = plan;
+  invalid.flags = openhd_single_time::kGroundFlag;
+  invalid.channel_count = 2;
+  assert(!openhd_single_time::valid(invalid));
+  invalid = plan;
+  invalid.flags = openhd_single_time::kFhssFlag;
+  invalid.channel_count = 1;
+  assert(!openhd_single_time::valid(invalid));
+  invalid = plan;
+  invalid.flags = openhd_single_time::kFhssFlag;
+  invalid.channel_count = 2;
+  invalid.frequencies_mhz[1] = invalid.frequencies_mhz[0];
+  assert(!openhd_single_time::valid(invalid));
+  invalid = plan;
+  invalid.dwell_us = 0;
+  assert(!openhd_single_time::valid(invalid));
+  invalid = plan;
+  invalid.pre_guard_us = invalid.dwell_us - 10000U;
+  assert(!openhd_single_time::valid(invalid));
+  invalid = plan;
+  invalid.frequencies_mhz[0] = 4995U;
+  assert(!openhd_single_time::valid(invalid));
   return 0;
 }
