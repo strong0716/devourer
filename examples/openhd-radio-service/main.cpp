@@ -636,6 +636,7 @@ class RadioSession {
 
  private:
   void timed_loop() {
+    std::uint64_t drain_wait_started_us = 0;
     while (m_timed_thread_run) {
       {
         std::lock_guard<std::mutex> lock(m_timed_mutex);
@@ -643,6 +644,7 @@ class RadioSession {
         // A TX or retune fault stays closed until a fresh plan and phase.
         // Never keep retuning from a stale phase.
         const auto request = m_timed_fault ? std::nullopt : m_timed.step(now_us);
+        if (!request) drain_wait_started_us = 0;
         if (request && m_radio && m_initialized) {
           bool success = false;
           const auto channel = devourer::freq_to_chan(
@@ -651,6 +653,25 @@ class RadioSession {
           // state drain. Independent RF timing remains a release gate.
           const bool usb_idle = m_radio->WaitTxIdle(2000);
           const bool mac_idle = usb_idle && m_radio->WaitMacTxIdle(5000);
+          if (!mac_idle) {
+            // A single 5 ms MAC drain miss is not a hardware fault. Leave the
+            // old slot active: Scheduler::status() then keeps TX gated while
+            // the next loop retries. A stuck queue still faults within 100 ms.
+            if (!drain_wait_started_us) {
+              drain_wait_started_us = now_us;
+              m_logger->warn("timed retune waiting for drain: usb_idle={} slot={} frequency={}",
+                             usb_idle, request->slot, request->frequency_mhz);
+            }
+            if (monotonic_us() - drain_wait_started_us < 100000U)
+              continue;
+            m_logger->error("timed retune drain fault after 100 ms: usb_idle={} slot={} frequency={}",
+                            usb_idle, request->slot, request->frequency_mhz);
+            m_timed.retune_complete(*request, monotonic_us(), false);
+            m_timed_fault = true;
+            drain_wait_started_us = 0;
+            continue;
+          }
+          drain_wait_started_us = 0;
           if (mac_idle && channel > 0 && channel <= 255) {
             try {
               m_radio->FastRetune(static_cast<std::uint8_t>(channel), true);
