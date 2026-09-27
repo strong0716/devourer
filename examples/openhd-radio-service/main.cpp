@@ -401,6 +401,10 @@ class RadioSession {
         .Channel = static_cast<std::uint8_t>(channel),
         .ChannelOffset = primary_channel_offset,
         .ChannelWidth = width_mhz == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20};
+    if (m_initialized && !m_radio->WaitTxIdle(10000)) {
+      error = "USB TX must drain before changing the RF profile";
+      return false;
+    }
     try {
       if (!m_initialized) {
         m_radio->InitWrite(selected);
@@ -456,21 +460,55 @@ class RadioSession {
       return TxOutcome::GateClosed;
     if (m_timed_fault) return TxOutcome::Fault;
     const auto airtime = openhd_single_time::tx_airtime_us(data, length);
-    if (!airtime || !m_radio->WaitTxIdle(2000)) {
+    if (!airtime) {
+      m_logger->error("timed TX fault: unsupported frame length={}", length);
       m_timed_fault = true;
       return TxOutcome::Fault;
     }
-    // Reserve USB/NIC tail beyond the conservative PHY airtime. This is a
-    // laboratory bound until an independent RF witness measures the tail.
+    if (!m_radio->WaitTxIdle(2000)) {
+      m_logger->error("timed TX fault: USB not idle before submit");
+      m_timed_fault = true;
+      return TxOutcome::Fault;
+    }
+    // The same 5 ms budget covers USB completion and the remaining NIC tail.
+    // This is a laboratory bound until an independent RF witness measures it.
     constexpr std::uint32_t kTailReserveUs = 5000;
     const auto now_us = monotonic_us();
     if (!m_timed.can_tx(now_us, tx_class == TxClass::TimedControl,
                         *airtime + kTailReserveUs))
       return TxOutcome::GateClosed;
-    if (!m_radio->send_packet(data, length) ||
-        !m_radio->WaitTxIdle(2000)) {
+    const auto tx_before = m_radio->GetTxStats();
+    if (!m_radio->send_packet(data, length)) {
+      m_logger->error("timed TX fault: USB submit failed");
       m_timed_fault = true;
       return TxOutcome::Fault;
+    }
+    constexpr std::uint32_t kNormalUsbWaitUs = 2000;
+    const bool usb_idle_on_time = m_radio->WaitTxIdle(kNormalUsbWaitUs);
+    const auto tx_after = m_radio->GetTxStats();
+    if (tx_after.failed != tx_before.failed) {
+      m_logger->error(
+          "timed TX fault: USB transfer failed; before={} after={} "
+          "last_error_rc={} last_timeout={}",
+          tx_before.failed, tx_after.failed,
+          tx_after.last_error_rc, tx_after.last_was_timeout);
+      m_timed_fault = true;
+      return TxOutcome::Fault;
+    }
+    if (!usb_idle_on_time) {
+      // Keep the RF mutex and TX gate closed until the outstanding transfer
+      // drains. A late completion may lose a hop, but it must never retune
+      // while the old-frequency packet is still pending.
+      const bool drained = m_radio->WaitTxIdle(20000);
+      if (!drained || m_radio->GetTxStats().failed != tx_before.failed) {
+        m_logger->error("timed TX fault: USB transfer did not drain safely");
+        m_timed_fault = true;
+        return TxOutcome::Fault;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(kTailReserveUs));
+      m_logger->warn("timed TX USB completion exceeded {} us; RF held until drain",
+                     kNormalUsbWaitUs);
+      return TxOutcome::GateClosed;
     }
     return TxOutcome::Submitted;
   }
