@@ -317,6 +317,7 @@ public:
   bool WaitTxIdle(unsigned timeout_us) override {
     return _device.WaitTxIdle(timeout_us);
   }
+  bool WaitMacTxIdle(unsigned timeout_us) override;
   SelectedChannel GetSelectedChannel() override;
   /* EFUSE MAC via EepromManager (offsets from upstream hal_pg.h: 8812AU 0xD7,
    * 8814AU 0xD8, 8821AU 0x107). The EEPROM map is already read during bring-up,

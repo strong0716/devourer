@@ -831,6 +831,32 @@ int32_t RtlJaguarDevice::PinBeaconTbtt(int32_t offset_us) {
   return static_cast<int32_t>(off);
 }
 
+bool RtlJaguarDevice::WaitMacTxIdle(unsigned timeout_us) {
+  if (timeout_us == 0) return false;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::microseconds(timeout_us);
+  const auto empty = [this]() {
+    // Same RTL8812A registers and all-queue mask as OpenHD's kernel drain.
+    // ctrl_read throws on a failed or short USB control transfer.
+    return (_device.rtw_read<uint16_t>(0x041a) & 0x0fff) == 0x0fff &&
+           _device.rtw_read<uint32_t>(0x05f8) == 0;
+  };
+  try {
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (empty()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (empty() && std::chrono::steady_clock::now() < deadline)
+          return true;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(250));
+    }
+  } catch (const std::exception& error) {
+    _logger->error("MAC TX drain register read failed: {}", error.what());
+  }
+  return false;
+}
+
 bool RtlJaguarDevice::send_packet(const uint8_t *packet, size_t length) {
   /* Build one TXDMA block (40-byte descriptor + frame, build_tx_block) and
    * submit it as one async bulk-OUT. */

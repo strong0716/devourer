@@ -72,6 +72,11 @@ public:
     (void)timeout_us;
     return false;
   }
+  // USB completion is not MAC/RF completion. Timed retune requires both.
+  virtual bool WaitMacTxIdle(unsigned timeout_us) {
+    (void)timeout_us;
+    return false;
+  }
   virtual void SetMonitorChannel(SelectedChannel channel) = 0;
 
   /* Lean intra-band, same-bandwidth channel retune for hop/sweep dwells: the RF

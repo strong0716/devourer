@@ -401,8 +401,10 @@ class RadioSession {
         .Channel = static_cast<std::uint8_t>(channel),
         .ChannelOffset = primary_channel_offset,
         .ChannelWidth = width_mhz == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20};
-    if (m_initialized && !m_radio->WaitTxIdle(10000)) {
-      error = "USB TX must drain before changing the RF profile";
+    if (m_initialized &&
+        (!m_radio->WaitTxIdle(10000) ||
+         (timed_chip_supported() && !m_radio->WaitMacTxIdle(10000)))) {
+      error = "radio TX must drain before changing the RF profile";
       return false;
     }
     try {
@@ -526,8 +528,10 @@ class RadioSession {
       if (channel <= 0 || channel > 255)
         return false;
     }
-    if (!m_initialized || m_width_mhz != 20 || generation == 0 ||
+    if (!timed_chip_supported() || !m_initialized || m_width_mhz != 20 ||
+        generation == 0 ||
         !m_radio->WaitTxIdle(10000) ||
+        !m_radio->WaitMacTxIdle(10000) ||
         !m_timed.configure(plan, m_frequency_mhz)) return false;
     m_timed_generation = generation;
     m_timed_fault = false;
@@ -589,6 +593,10 @@ class RadioSession {
   int bus() const { return m_bus; }
   const std::string& port() const { return m_port; }
   const devourer::AdapterCaps& caps() const { return m_caps; }
+  bool timed_chip_supported() const {
+    return m_caps.chip_name &&
+           std::strcmp(m_caps.chip_name, "RTL8812A") == 0;
+  }
 
   void set_rx_callback(std::function<void(const Packet&)> callback) {
     m_rx_callback = std::move(callback);
@@ -639,10 +647,11 @@ class RadioSession {
           bool success = false;
           const auto channel = devourer::freq_to_chan(
               static_cast<std::uint16_t>(request->frequency_mhz));
-          // The mutex already prevents a new submission in this session.
-          // This proves only USB completion; RF tail still needs a witness.
+          // The mutex prevents new submissions while both USB and the MAC TX
+          // state drain. Independent RF timing remains a release gate.
           const bool usb_idle = m_radio->WaitTxIdle(2000);
-          if (usb_idle && channel > 0 && channel <= 255) {
+          const bool mac_idle = usb_idle && m_radio->WaitMacTxIdle(5000);
+          if (mac_idle && channel > 0 && channel <= 255) {
             try {
               m_radio->FastRetune(static_cast<std::uint8_t>(channel), true);
               m_frequency_mhz = request->frequency_mhz;
@@ -859,9 +868,11 @@ class Service {
     std::uint16_t capabilities = kCapabilityFixedRf;
     if (session.caps().txpwr.supported)
       capabilities |= kCapabilityTxPowerIndex;
-    if (kTimedModes & 1U) capabilities |= kCapabilityFixedTdma;
-    if (kTimedModes & 2U) capabilities |= kCapabilityFhss;
-    if (kTimedModes & 4U) capabilities |= kCapabilityFhssTdma;
+    if (session.timed_chip_supported()) {
+      if (kTimedModes & 1U) capabilities |= kCapabilityFixedTdma;
+      if (kTimedModes & 2U) capabilities |= kCapabilityFhss;
+      if (kTimedModes & 4U) capabilities |= kCapabilityFhssTdma;
+    }
     put_u16(payload, capabilities);
     return send_message(fd, send_mutex, kReady, sequence, payload.data(),
                         payload.size());
