@@ -632,7 +632,9 @@ class RadioSession {
       {
         std::lock_guard<std::mutex> lock(m_timed_mutex);
         const auto now_us = monotonic_us();
-        const auto request = m_timed.step(now_us);
+        // A TX or retune fault stays closed until a fresh plan and phase.
+        // Never keep retuning from a stale phase.
+        const auto request = m_timed_fault ? std::nullopt : m_timed.step(now_us);
         if (request && m_radio && m_initialized) {
           bool success = false;
           const auto channel = devourer::freq_to_chan(
@@ -652,6 +654,7 @@ class RadioSession {
             }
           }
           m_timed.retune_complete(*request, monotonic_us(), success);
+          if (!success) m_timed_fault = true;
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
