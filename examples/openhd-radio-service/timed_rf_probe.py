@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Lab-only IPC sender and independent monitor receiver for timed RF slots.
 
-Run rx on a second Pi with a kernel monitor interface already tuned to 5200
-MHz. Run tx against a service built with OPENHD_TIMED_LAB_MODES=1. This tool
-does not alter radio ownership or interface configuration.
+Run rx on a second Pi with its receiver tuned to the requested frequency.
+Run tx against a lab-enabled service. This tool does not alter radio ownership
+or interface configuration.
 """
 
 import argparse
@@ -91,18 +91,23 @@ def transmit(args):
     kind, sequence, ready = receive_ipc(sock)
     if kind != 2 or sequence != 1:
         raise RuntimeError("service did not return Ready")
-    if len(ready) < 2 or not (struct.unpack(">H", ready[-2:])[0] & 0x0004):
-        raise RuntimeError("lab service lacks fixed TDMA capability")
+    required_capability = 0x0008 if args.fhss else 0x0004
+    if len(ready) < 2 or not (struct.unpack(">H", ready[-2:])[0] & required_capability):
+        raise RuntimeError("lab service lacks the requested timed capability")
     request(sock, 3, 2, struct.pack(">IIB", 5200, 20, 0))
     request(sock, 4, 6, struct.pack(">iB", 10, 0))
+    frequencies = (5200, 5220) if args.fhss else (5200,)
+    flags = 3 if args.fhss else 5
     plan = (bytes([1]) + struct.pack(">IIIIQI", PLAN_PERIOD_US, 100_000,
-            8_000, 3_000, 20260927, 1) + struct.pack(">II", 5200, 10_000_000)
-            + bytes([1, 5]))
+            8_000, 3_000, 20260927, len(frequencies)) +
+            b"".join(struct.pack(">I", value) for value in frequencies) +
+            struct.pack(">I", 10_000_000) + bytes([1, flags]))
     generation = 1
     request(sock, 11, 3, plan + struct.pack(">I", generation))
     anchor = now_us()
     request(sock, 11, 4, bytes([2]) + struct.pack(">QI", anchor, 0))
-    request(sock, 11, 5, bytes([4]) + struct.pack(">QQQQ", 0b110, 0, 0, 0))
+    if not args.fhss:
+        request(sock, 11, 5, bytes([4]) + struct.pack(">QQQQ", 0b110, 0, 0, 0))
     rtap = bytes.fromhex("00000d00008008000800373003")
     mac = bytes.fromhex("18d6c718b699")
     header = struct.pack("<HH", 0x0108, 0) + b"\xff" * 6 + mac + b"\xff" * 6
@@ -113,7 +118,7 @@ def transmit(args):
     next_members = time.monotonic() + 0.5
     members_revision = 0
     while time.monotonic() < deadline:
-        if time.monotonic() >= next_members:
+        if not args.fhss and time.monotonic() >= next_members:
             request(sock, 11, 500000 + members_revision,
                     bytes([4]) + struct.pack(">QQQQ", 0b110, 0, 0, 0))
             members_revision += 1
@@ -135,7 +140,8 @@ def transmit(args):
         request(sock, 11, 700001, plan + struct.pack(">I", 2))
         second_anchor = now_us()
         request(sock, 11, 700002, bytes([2]) + struct.pack(">QI", second_anchor, 0))
-        request(sock, 11, 700003, bytes([4]) + struct.pack(">QQQQ", 0b110, 0, 0, 0))
+        if not args.fhss:
+            request(sock, 11, 700003, bytes([4]) + struct.pack(">QQQQ", 0b110, 0, 0, 0))
         for i in range(100):
             kind = 2 if i % 2 == 0 else 3
             stamp = now_us()
@@ -164,7 +170,7 @@ def transmit(args):
                       "beacon_offered": sent_beacon,
                       "end_remote_minus_local_us": end_offset_us,
                       "end_sync_min_rtt_us": end_rtt_us,
-                      "generation_probe": args.generation_probe,
+                      "generation_probe": args.generation_probe, "fhss": args.fhss,
                       "status": list(struct.unpack(">IIIIII", status))}))
     sock.close()
 
@@ -178,7 +184,7 @@ def receive(args):
         kind, sequence, _ = receive_ipc(radio)
         if kind != 2 or sequence != 1:
             raise RuntimeError("receiver service did not return Ready")
-        request(radio, 3, 2, struct.pack(">IIB", 5200, 20, 0))
+        request(radio, 3, 2, struct.pack(">IIB", args.rx_frequency, 20, 0))
         radio.settimeout(None)
     else:
         radio = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
@@ -228,6 +234,7 @@ def main():
     rx = sub.add_parser("rx")
     rx.add_argument("--interface", default="wlan1")
     rx.add_argument("--socket")
+    rx.add_argument("--rx-frequency", type=int, default=5200)
     rx.add_argument("--seconds", type=float, default=8)
     rx.add_argument("--sync-port", type=int, default=19927)
     rx.add_argument("--output", required=True)
@@ -239,6 +246,7 @@ def main():
     tx.add_argument("--interval-ms", type=float, default=1)
     tx.add_argument("--payload-bytes", type=int, default=128)
     tx.add_argument("--generation-probe", action="store_true")
+    tx.add_argument("--fhss", action="store_true")
     args = parser.parse_args()
     if args.mode == "tx" and not 0 <= args.payload_bytes <= 2000:
         parser.error("--payload-bytes must be 0..2000")
