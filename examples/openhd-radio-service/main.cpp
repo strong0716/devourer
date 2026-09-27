@@ -1335,6 +1335,10 @@ class Service {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--print-lab-modes") == 0) {
+    std::printf("%d\n", OPENHD_TIMED_LAB_MODES);
+    return 0;
+  }
   Args args;
   if (!parse_args(argc, argv, args)) {
     std::fprintf(stderr,
