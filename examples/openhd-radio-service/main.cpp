@@ -483,8 +483,11 @@ class RadioSession {
       m_timed_fault = true;
       return TxOutcome::Fault;
     }
-    constexpr std::uint32_t kNormalUsbWaitUs = 2000;
-    const bool usb_idle_on_time = m_radio->WaitTxIdle(kNormalUsbWaitUs);
+    // Hopping has a full dwell to absorb normal USB jitter; fixed TDMA has
+    // only a short data seat, where blocking every packet for 5 ms starves
+    // video. Both modes still hold RF ownership until a late TX drains.
+    const std::uint32_t normal_usb_wait_us = m_timed.hopping() ? 5000 : 2000;
+    const bool usb_idle_on_time = m_radio->WaitTxIdle(normal_usb_wait_us);
     const auto tx_after = m_radio->GetTxStats();
     if (tx_after.failed != tx_before.failed) {
       m_logger->error(
@@ -507,7 +510,7 @@ class RadioSession {
       }
       std::this_thread::sleep_for(std::chrono::microseconds(kTailReserveUs));
       m_logger->warn("timed TX USB completion exceeded {} us; RF held until drain",
-                     kNormalUsbWaitUs);
+                     normal_usb_wait_us);
       return TxOutcome::GateClosed;
     }
     return TxOutcome::Submitted;
