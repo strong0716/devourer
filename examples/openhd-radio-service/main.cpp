@@ -451,6 +451,7 @@ class RadioSession {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
     if (!m_radio || !m_initialized || !data || !length)
       return TxOutcome::Fault;
+    if (m_timed_fault) return TxOutcome::Fault;
     if (!m_timed.configured()) {
       if (tx_class != TxClass::LegacyData || generation != 0)
         return TxOutcome::GateClosed;
@@ -460,7 +461,6 @@ class RadioSession {
     if (tx_class == TxClass::LegacyData ||
         generation != m_timed_generation)
       return TxOutcome::GateClosed;
-    if (m_timed_fault) return TxOutcome::Fault;
     const auto airtime = openhd_single_time::tx_airtime_us(data, length);
     if (!airtime) {
       m_logger->error("timed TX fault: unsupported frame length={}", length);
@@ -585,7 +585,9 @@ class RadioSession {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
     m_timed.stop();
     m_timed_generation = 0;
-    m_timed_fault = false;
+    // Stop and rejected replacement plans must not fall back to legacy TX.
+    // A fresh client session or a successful Configure is needed to reopen TX.
+    m_timed_fault = true;
   }
 
   std::uint32_t frequency_mhz() const { return m_frequency_mhz; }
@@ -1087,6 +1089,9 @@ class Service {
           openhd_single_time::Plan plan{};
           std::uint32_t generation = 0;
           if (operation == 1) {
+            // A replacement Configure revokes the previous generation even
+            // when the new plan is malformed or its mode is not enabled.
+            session.timed_stop();
             malformed = !decode_single_time_plan(
                 message.payload, message.payload_size, plan, generation);
             if (!malformed &&
