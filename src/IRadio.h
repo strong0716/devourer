@@ -66,6 +66,12 @@ public:
   /* Ask a running StartRxLoop to exit (sets a flag; the caller then joins
    * whatever thread runs StartRxLoop). Default no-op. */
   virtual void StopRxLoop() {}
+  // A timed executor must check this before retuning. USB completion does not
+  // prove that the NIC has stopped transmitting over the air.
+  virtual bool WaitTxIdle(unsigned timeout_us) {
+    (void)timeout_us;
+    return false;
+  }
   virtual void SetMonitorChannel(SelectedChannel channel) = 0;
 
   /* Lean intra-band, same-bandwidth channel retune for hop/sweep dwells: the RF

@@ -1217,6 +1217,22 @@ void UsbTransport::quiesce_tx() {
   }
 }
 
+bool UsbTransport::wait_tx_idle(unsigned timeout_us) {
+  if (_tx_shutdown.load(std::memory_order_acquire)) return false;
+  const auto failures = _tx_failed.load(std::memory_order_acquire);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::microseconds(timeout_us);
+  while (_tx_inflight.load(std::memory_order_acquire) != 0) {
+    if (_tx_shutdown.load(std::memory_order_acquire) ||
+        std::chrono::steady_clock::now() >= deadline)
+      return false;
+    struct timeval wait {0, 500};
+    if (libusb_handle_events_timeout_completed(_ctx, &wait, nullptr) != 0)
+      return false;
+  }
+  return _tx_failed.load(std::memory_order_acquire) == failures;
+}
+
 bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
                             unsigned timeout_ms) {
   flush_writes();

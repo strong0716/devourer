@@ -55,6 +55,10 @@ int main() {
   const auto next = air.step(1093000U);
   assert(next && next->frequency_mhz == 5220U && next->slot == 1);
   assert(air.status(1093000U).tx_gated);
+  air.retune_complete(*next, 1093500U, false);
+  assert(air.status(1093600U).state == RunState::Fault);
+  assert(!air.can_tx(1093600U, true, 100U));
+  assert(air.step(1093700U));
   air.retune_complete(*next, 1094000U, true);
   assert(air.status(1104000U).state == RunState::Running);
   assert(air.can_tx(1104000U, true, 1000U));

@@ -120,6 +120,12 @@ public:
    * call and not destructor work. Idempotent. Default no-op: a transport whose
    * TX is synchronous has nothing outstanding by construction. */
   virtual void quiesce_tx() {}
+  /* Non-destructive drain for a timed RF boundary. Returns false when the
+   * transport cannot prove USB submission completion before the deadline. */
+  virtual bool wait_tx_idle(unsigned timeout_us) {
+    (void)timeout_us;
+    return false;
+  }
 
   /* ---- lifecycle / info ---- */
   /* Pre-power-on HCI programming, re-run per bring-up attempt (rtw88's

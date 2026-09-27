@@ -112,6 +112,7 @@ public:
   int rx_raw(uint8_t *buf, int len, int timeout_ms) override;
   void clear_halt(uint8_t ep) override { libusb_clear_halt(_dev_handle, ep); }
   void quiesce_tx() override;
+  bool wait_tx_idle(unsigned timeout_us) override;
 
   UsbLinkInfo usb_info() const override { return _info; }
   TxStats tx_stats() const override;

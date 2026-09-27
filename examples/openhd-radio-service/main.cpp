@@ -532,7 +532,10 @@ class RadioSession {
           bool success = false;
           const auto channel = devourer::freq_to_chan(
               static_cast<std::uint16_t>(request->frequency_mhz));
-          if (channel > 0 && channel <= 255) {
+          // The mutex already prevents a new submission in this session.
+          // This proves only USB completion; RF tail still needs a witness.
+          const bool usb_idle = m_radio->WaitTxIdle(2000);
+          if (usb_idle && channel > 0 && channel <= 255) {
             try {
               m_radio->FastRetune(static_cast<std::uint8_t>(channel), true);
               m_frequency_mhz = request->frequency_mhz;

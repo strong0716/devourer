@@ -314,6 +314,9 @@ public:
   void ClearAmpduMode() override;
   devourer::AmpduMode GetAmpduMode() override { return _ampdu; }
   devourer::TxStats GetTxStats() override { return _device.GetTxStats(); }
+  bool WaitTxIdle(unsigned timeout_us) override {
+    return _device.WaitTxIdle(timeout_us);
+  }
   SelectedChannel GetSelectedChannel() override;
   /* EFUSE MAC via EepromManager (offsets from upstream hal_pg.h: 8812AU 0xD7,
    * 8814AU 0xD8, 8821AU 0x107). The EEPROM map is already read during bring-up,
