@@ -122,7 +122,7 @@ inline bool tdma_data_allowed(std::uint32_t phase_us,
   return position >= begin && position < end && airtime_us <= end - position;
 }
 
-// OpenHD's normal timed TX uses a 13-byte TX_FLAGS+MCS radiotap header.
+// OpenHD's normal timed TX uses a 13-byte NOACK TX_FLAGS+MCS radiotap header.
 // Reserve airtime at the slowest HT20 rate (MCS0) plus queue margin, matching
 // the conservative bound in the kernel path. Unknown formats fail closed.
 inline std::optional<std::uint32_t> tx_airtime_us(
@@ -131,6 +131,7 @@ inline std::optional<std::uint32_t> tx_airtime_us(
       frame[0] != 0 || frame[1] != 0 || frame[2] != 13 || frame[3] != 0 ||
       frame[4] != 0 || frame[5] != 0x80 ||
       frame[6] != 0x08 || frame[7] != 0 ||
+      frame[8] != 0x08 || frame[9] != 0 ||
       !(frame[10] & 0x02) || frame[12] > 7)
     return std::nullopt;
   const auto mpdu_bytes = static_cast<std::uint32_t>(length - 13);
@@ -228,13 +229,14 @@ class Scheduler {
 
   std::optional<Retune> step(std::uint64_t now_us) {
     if (!configured_ || !(plan_.flags & kFhssFlag)) return std::nullopt;
+    if (fault_) return std::nullopt;
     if (synchronized_ && !(plan_.flags & kGroundFlag) &&
         (peer_received_us_ == 0 || now_us < peer_received_us_ ||
          now_us - peer_received_us_ > plan_.peer_timeout_us)) {
       synchronized_ = false;
     }
     if (!synchronized_ || now_us < sample_local_us_) {
-      if (fault_ || active_frequency_mhz_ != plan_.frequencies_mhz[0])
+      if (active_frequency_mhz_ != plan_.frequencies_mhz[0])
         return Retune{plan_.frequencies_mhz[0], 0};
       return std::nullopt;
     }
@@ -248,7 +250,7 @@ class Scheduler {
       target_slot = (slot + 1) % (plan_.period_us / plan_.dwell_us);
     const auto frequency = plan_.frequencies_mhz[
         channel_index(plan_, target_slot * plan_.dwell_us)];
-    if (fault_ || active_frequency_mhz_ != frequency ||
+    if (active_frequency_mhz_ != frequency ||
         active_slot_ != target_slot)
       return Retune{frequency, target_slot};
     return std::nullopt;
@@ -257,6 +259,7 @@ class Scheduler {
   void retune_complete(const Retune& request, std::uint64_t now_us,
                        bool success) {
     if (!configured_) return;
+    if (fault_) return;
     if (!success) {
       fault_ = true;
       return;

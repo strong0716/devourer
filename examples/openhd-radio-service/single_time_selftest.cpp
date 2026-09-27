@@ -49,6 +49,10 @@ int main() {
   assert(!openhd_single_time::tx_airtime_us(
       ht_frame.data(), ht_frame.size()));
   ht_frame[12] = 3;
+  ht_frame[8] = 0;
+  assert(!openhd_single_time::tx_airtime_us(
+      ht_frame.data(), ht_frame.size()));
+  ht_frame[8] = 0x08;
 
   using openhd_single_time::RunState;
   using openhd_single_time::Scheduler;
@@ -70,8 +74,16 @@ int main() {
   air.retune_complete(*next, 1093500U, false);
   assert(air.status(1093600U).state == RunState::Fault);
   assert(!air.can_tx(1093600U, true, 100U));
-  assert(air.step(1093700U));
+  assert(!air.step(1093700U));
   air.retune_complete(*next, 1094000U, true);
+  assert(air.status(1104000U).state == RunState::Fault);
+  assert(air.configure(plan, 5180U));
+  assert(air.set_phase(1100000U, 1100000U, 100000U));
+  assert(air.set_peer_lease(1100000U, 1100000U));
+  assert(air.set_members(1100000U, members));
+  const auto resumed = air.step(1100000U);
+  assert(resumed && resumed->frequency_mhz == 5220U);
+  air.retune_complete(*resumed, 1100500U, true);
   assert(air.status(1104000U).state == RunState::Running);
   assert(air.can_tx(1104000U, true, 1000U));
   assert(!air.can_tx(1104000U, false, 1000U));

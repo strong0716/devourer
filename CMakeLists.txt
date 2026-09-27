@@ -779,6 +779,7 @@ target_compile_definitions(openhd-radio-service PRIVATE
 
 add_executable(openhd-single-time-selftest
     examples/openhd-radio-service/single_time_selftest.cpp)
+target_compile_features(openhd-single-time-selftest PRIVATE cxx_std_20)
 add_test(NAME openhd-single-time-selftest COMMAND openhd-single-time-selftest)
 
 # txpower — reference consumer of the runtime TX-power API
