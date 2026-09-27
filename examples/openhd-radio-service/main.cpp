@@ -489,6 +489,7 @@ class RadioSession {
     // only a short data seat, where blocking every packet for 5 ms starves
     // video. Both modes still hold RF ownership until a late TX drains.
     const std::uint32_t normal_usb_wait_us = m_timed.hopping() ? 5000 : 2000;
+    const auto submitted_us = monotonic_us();
     const bool usb_idle_on_time = m_radio->WaitTxIdle(normal_usb_wait_us);
     const auto tx_after = m_radio->GetTxStats();
     if (tx_after.failed != tx_before.failed) {
@@ -503,16 +504,23 @@ class RadioSession {
     if (!usb_idle_on_time) {
       // Keep the RF mutex and TX gate closed until the outstanding transfer
       // drains. A late completion may lose a hop, but it must never retune
-      // while the old-frequency packet is still pending.
-      const bool drained = m_radio->WaitTxIdle(20000);
+      // while the old-frequency packet is still pending. Retune already
+      // tolerates up to 100 ms of drain backpressure; use the same total
+      // bound here so a successful 25+ ms USB completion is not a fatal TX.
+      constexpr std::uint32_t kMaxUsbDrainUs = 100000;
+      const bool drained = m_radio->WaitTxIdle(
+          kMaxUsbDrainUs - normal_usb_wait_us);
       if (!drained || m_radio->GetTxStats().failed != tx_before.failed) {
-        m_logger->error("timed TX fault: USB transfer did not drain safely");
+        m_logger->error(
+            "timed TX fault: USB transfer did not drain safely after {} us",
+            monotonic_us() - submitted_us);
         m_timed_fault = true;
         return TxOutcome::Fault;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(kTailReserveUs));
-      m_logger->warn("timed TX USB completion exceeded {} us; RF held until drain",
-                     normal_usb_wait_us);
+      m_logger->warn(
+          "timed TX USB completion exceeded {} us; drained after {} us with RF held",
+          normal_usb_wait_us, monotonic_us() - submitted_us);
       return TxOutcome::GateClosed;
     }
     return TxOutcome::Submitted;
