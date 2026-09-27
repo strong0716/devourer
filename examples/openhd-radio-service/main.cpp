@@ -61,8 +61,24 @@ constexpr std::uint16_t kStop = 9;
 constexpr std::uint16_t kTxError = 10;
 constexpr std::uint16_t kSingleTimeControl = 11;
 constexpr std::uint16_t kTimedControlBeacon = 12;
+constexpr std::uint16_t kTimedDataPacket = 13;
 constexpr std::uint16_t kCapabilityFixedRf = 1U << 0;
 constexpr std::uint16_t kCapabilityTxPowerIndex = 1U << 1;
+constexpr std::uint16_t kCapabilityFixedTdma = 1U << 2;
+constexpr std::uint16_t kCapabilityFhss = 1U << 3;
+constexpr std::uint16_t kCapabilityFhssTdma = 1U << 4;
+// Production remains closed until each mode has real RF timing evidence.
+// Lab builds may opt into individual modes without changing the air protocol.
+constexpr std::uint8_t kValidatedTimedModes = 0;
+constexpr std::uint8_t kTimedModes =
+    kValidatedTimedModes | OPENHD_TIMED_LAB_MODES;
+static_assert(kTimedModes <= 7);
+
+std::uint8_t timed_mode_bit(std::uint8_t flags) {
+  const bool fhss = (flags & openhd_single_time::kFhssFlag) != 0;
+  const bool tdma = (flags & openhd_single_time::kTdmaFlag) != 0;
+  return fhss ? (tdma ? 4U : 2U) : (tdma ? 1U : 0U);
+}
 // Values used by Devourer's SelectedChannel::ChannelOffset.
 constexpr std::uint8_t kPrimaryOffsetDontCare = 0;
 constexpr std::uint8_t kPrimaryOffsetLower = 1;
@@ -147,7 +163,8 @@ bool get_u64(const std::uint8_t* data, std::size_t size,
 }
 
 bool decode_single_time_plan(const std::uint8_t* data, std::size_t size,
-                             openhd_single_time::Plan& plan) {
+                             openhd_single_time::Plan& plan,
+                             std::uint32_t& generation) {
   std::size_t offset = 1;  // operation byte
   if (!get_u32(data, size, offset, plan.period_us) ||
       !get_u32(data, size, offset, plan.dwell_us) ||
@@ -160,11 +177,12 @@ bool decode_single_time_plan(const std::uint8_t* data, std::size_t size,
   for (std::uint32_t i = 0; i < plan.channel_count; ++i)
     if (!get_u32(data, size, offset, plan.frequencies_mhz[i])) return false;
   if (!get_u32(data, size, offset, plan.peer_timeout_us) ||
-      offset + 2 != size)
+      offset + 6 != size)
     return false;
   plan.own_id = data[offset++];
   plan.flags = data[offset++];
-  return openhd_single_time::valid(plan);
+  return get_u32(data, size, offset, generation) && generation != 0 &&
+         openhd_single_time::valid(plan);
 }
 
 std::vector<std::uint8_t> encode(std::uint16_t type, std::uint32_t sequence,
@@ -279,6 +297,8 @@ libusb_device_handle* open_device(libusb_context* context, const Args& args,
 
 class RadioSession {
  public:
+  enum class TxOutcome { Submitted, GateClosed, Fault };
+  enum class TxClass { LegacyData, TimedData, TimedControl };
   explicit RadioSession(Logger_t logger) : m_logger(std::move(logger)) {}
   ~RadioSession() { close(); }
 
@@ -408,6 +428,7 @@ class RadioSession {
   }
 
   bool set_tx_power(std::int32_t openhd_index, std::string& error) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
     if (!m_radio || !m_caps.txpwr.supported || openhd_index < 0 ||
         openhd_index > 63) {
       error = "RTL8812AU TX power index must be in the range 0..63";
@@ -419,19 +440,56 @@ class RadioSession {
     return true;
   }
 
-  bool send_packet(const std::uint8_t* data, std::size_t length) {
+  TxOutcome send_packet(const std::uint8_t* data, std::size_t length,
+                        TxClass tx_class, std::uint32_t generation) {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
-    // Timed TX stays closed until the USB/NIC tail and packet class contract
-    // are proven. A socket client cannot bypass the unadvertised capability.
-    if (m_timed.configured()) return false;
-    return m_radio && m_initialized && data && length &&
-           m_radio->send_packet(data, length);
+    if (!m_radio || !m_initialized || !data || !length)
+      return TxOutcome::Fault;
+    if (!m_timed.configured()) {
+      if (tx_class != TxClass::LegacyData || generation != 0)
+        return TxOutcome::GateClosed;
+      return m_radio->send_packet(data, length) ? TxOutcome::Submitted
+                                                : TxOutcome::Fault;
+    }
+    if (tx_class == TxClass::LegacyData ||
+        generation != m_timed_generation)
+      return TxOutcome::GateClosed;
+    if (m_timed_fault) return TxOutcome::Fault;
+    const auto airtime = openhd_single_time::tx_airtime_us(data, length);
+    if (!airtime || !m_radio->WaitTxIdle(2000)) {
+      m_timed_fault = true;
+      return TxOutcome::Fault;
+    }
+    // Reserve USB/NIC tail beyond the conservative PHY airtime. This is a
+    // laboratory bound until an independent RF witness measures the tail.
+    constexpr std::uint32_t kTailReserveUs = 5000;
+    const auto now_us = monotonic_us();
+    if (!m_timed.can_tx(now_us, tx_class == TxClass::TimedControl,
+                        *airtime + kTailReserveUs))
+      return TxOutcome::GateClosed;
+    if (!m_radio->send_packet(data, length) ||
+        !m_radio->WaitTxIdle(2000)) {
+      m_timed_fault = true;
+      return TxOutcome::Fault;
+    }
+    return TxOutcome::Submitted;
   }
 
-  bool timed_configure(const openhd_single_time::Plan& plan) {
+  bool timed_configure(const openhd_single_time::Plan& plan,
+                       std::uint32_t generation) {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
-    if (!m_initialized || m_width_mhz != 20 ||
+    for (std::uint32_t i = 0; i < plan.channel_count; ++i) {
+      if (plan.frequencies_mhz[i] > 0xffff) return false;
+      const auto channel = devourer::freq_to_chan(
+          static_cast<std::uint16_t>(plan.frequencies_mhz[i]));
+      if (channel <= 0 || channel > 255)
+        return false;
+    }
+    if (!m_initialized || m_width_mhz != 20 || generation == 0 ||
+        !m_radio->WaitTxIdle(10000) ||
         !m_timed.configure(plan, m_frequency_mhz)) return false;
+    m_timed_generation = generation;
+    m_timed_fault = false;
     if (!m_timed_thread.joinable()) {
       m_timed_thread_run = true;
       m_timed_thread = std::thread([this] { timed_loop(); });
@@ -463,12 +521,18 @@ class RadioSession {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
     auto result = m_timed.status(monotonic_us());
     if (!result.configured) result.target_frequency_mhz = m_frequency_mhz;
+    if (m_timed_fault) {
+      result.tx_gated = 1;
+      result.state = openhd_single_time::RunState::Fault;
+    }
     return result;
   }
 
   void timed_stop() {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
     m_timed.stop();
+    m_timed_generation = 0;
+    m_timed_fault = false;
   }
 
   std::uint32_t frequency_mhz() const { return m_frequency_mhz; }
@@ -588,6 +652,8 @@ class RadioSession {
   std::uint32_t m_width_mhz = 0;
   std::mutex m_timed_mutex;
   openhd_single_time::Scheduler m_timed;
+  bool m_timed_fault = false;
+  std::uint32_t m_timed_generation = 0;
   std::atomic<bool> m_timed_thread_run{false};
   std::thread m_timed_thread;
 };
@@ -749,6 +815,9 @@ class Service {
     std::uint16_t capabilities = kCapabilityFixedRf;
     if (session.caps().txpwr.supported)
       capabilities |= kCapabilityTxPowerIndex;
+    if (kTimedModes & 1U) capabilities |= kCapabilityFixedTdma;
+    if (kTimedModes & 2U) capabilities |= kCapabilityFhss;
+    if (kTimedModes & 4U) capabilities |= kCapabilityFhssTdma;
     put_u16(payload, capabilities);
     return send_message(fd, send_mutex, kReady, sequence, payload.data(),
                         payload.size());
@@ -842,36 +911,42 @@ class Service {
         (void)send_response(client, send_mutex, message.sequence, message.type,
                             applied ? 0 : 5, applied ? 0 : EINVAL,
                             applied ? "TX power index applied" : detail);
-      } else if (message.type == kTimedControlBeacon &&
-                 message.payload_size > sizeof(std::uint32_t)) {
-        // This is the only over-air beacon allowed outside a TDMA data slot.
-        // Keep it closed with the other timed TX until RF-tail validation.
-        const std::string error = "timed beacon TX is not enabled";
-        (void)send_message(client, send_mutex, kTxError, message.sequence,
-                           reinterpret_cast<const std::uint8_t*>(error.data()),
-                           error.size(), true);
-      } else if (message.type == kTxPacket &&
+      } else if ((message.type == kTxPacket ||
+                  message.type == kTimedControlBeacon ||
+                  message.type == kTimedDataPacket) &&
                  message.payload_size > sizeof(std::uint32_t)) {
         std::uint32_t tx_sequence = 0;
         if (!get_u32(message.payload, message.payload_size, offset,
                      tx_sequence)) {
           break;
         }
+        std::uint32_t generation = 0;
+        if (message.type != kTxPacket &&
+            !get_u32(message.payload, message.payload_size, offset,
+                     generation)) {
+          break;
+        }
         const auto* tx_data = message.payload + offset;
         const auto tx_length = message.payload_size - offset;
         record_trace("TX", tx_sequence, tx_data, tx_length, "");
         log_tx_prefix(tx_data, tx_length, tx_sequence);
-        const bool submitted = session.send_packet(tx_data, tx_length);
+        const auto tx_class = message.type == kTimedControlBeacon
+            ? RadioSession::TxClass::TimedControl
+            : message.type == kTimedDataPacket
+                ? RadioSession::TxClass::TimedData
+                : RadioSession::TxClass::LegacyData;
+        const auto outcome = session.send_packet(
+            tx_data, tx_length, tx_class, generation);
         {
           std::lock_guard<std::mutex> lock(m_stats_mutex);
           ++m_tx_attempted;
-          if (submitted) {
+          if (outcome == RadioSession::TxOutcome::Submitted) {
             ++m_tx_submitted;
           } else {
             ++m_tx_rejected;
           }
         }
-        if (!submitted) {
+        if (outcome == RadioSession::TxOutcome::Fault) {
           const std::string error = "Devourer rejected TX sequence " +
                                     std::to_string(tx_sequence);
           (void)send_message(client, send_mutex, kTxError, message.sequence,
@@ -897,11 +972,13 @@ class Service {
                               false, status);
         } else {
           openhd_single_time::Plan plan{};
+          std::uint32_t generation = 0;
           if (operation == 1) {
             malformed = !decode_single_time_plan(
-                message.payload, message.payload_size, plan);
-            // Deliberately reject even a valid plan until timed TX has a
-            // bounded RF tail and the OpenHD packet-class contract is wired.
+                message.payload, message.payload_size, plan, generation);
+            if (!malformed &&
+                (kTimedModes & timed_mode_bit(plan.flags)) != 0)
+              applied = session.timed_configure(plan, generation);
           } else if (operation == 2 && message.payload_size == 13) {
             std::uint64_t local_us = 0;
             std::uint32_t phase_us = 0;

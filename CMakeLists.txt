@@ -769,6 +769,13 @@ add_executable(openhd-radio-service
     examples/openhd-radio-service/main.cpp)
 target_link_libraries(openhd-radio-service
     PRIVATE devourer PkgConfig::libusb Threads::Threads)
+set(OPENHD_TIMED_LAB_MODES 0 CACHE STRING
+    "Lab-only timed modes: 1=fixed TDMA, 2=FHSS, 4=FHSS+TDMA")
+if(NOT OPENHD_TIMED_LAB_MODES MATCHES "^[0-7]$")
+    message(FATAL_ERROR "OPENHD_TIMED_LAB_MODES must be 0..7")
+endif()
+target_compile_definitions(openhd-radio-service PRIVATE
+    OPENHD_TIMED_LAB_MODES=${OPENHD_TIMED_LAB_MODES})
 
 add_executable(openhd-single-time-selftest
     examples/openhd-radio-service/single_time_selftest.cpp)

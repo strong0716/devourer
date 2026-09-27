@@ -37,6 +37,18 @@ int main() {
   assert(openhd_single_time::tdma_data_allowed(22000U, count, seat, 1000U));
   assert(!openhd_single_time::tdma_data_allowed(21999U, count, seat, 1000U));
   assert(!openhd_single_time::tdma_data_allowed(22000U, count, seat, 16000U));
+  std::array<std::uint8_t, 1013> ht_frame{};
+  const std::array<std::uint8_t, 13> rtap{
+      0x00, 0x00, 0x0d, 0x00, 0x00, 0x80, 0x08,
+      0x00, 0x08, 0x00, 0x37, 0x30, 0x03};
+  for (std::size_t i = 0; i < rtap.size(); ++i) ht_frame[i] = rtap[i];
+  const auto reserved = openhd_single_time::tx_airtime_us(
+      ht_frame.data(), ht_frame.size());
+  assert(reserved && *reserved == 1810U);
+  ht_frame[12] = 9;
+  assert(!openhd_single_time::tx_airtime_us(
+      ht_frame.data(), ht_frame.size()));
+  ht_frame[12] = 3;
 
   using openhd_single_time::RunState;
   using openhd_single_time::Scheduler;

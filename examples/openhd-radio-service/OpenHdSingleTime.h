@@ -122,6 +122,21 @@ inline bool tdma_data_allowed(std::uint32_t phase_us,
   return position >= begin && position < end && airtime_us <= end - position;
 }
 
+// OpenHD's normal timed TX uses a 13-byte TX_FLAGS+MCS radiotap header.
+// Reserve airtime at the slowest HT20 rate (MCS0) plus queue margin, matching
+// the conservative bound in the kernel path. Unknown formats fail closed.
+inline std::optional<std::uint32_t> tx_airtime_us(
+    const std::uint8_t* frame, std::size_t length) {
+  if (!frame || length < 13 + 24 || length > 4096 ||
+      frame[0] != 0 || frame[1] != 0 || frame[2] != 13 || frame[3] != 0 ||
+      frame[4] != 0 || frame[5] != 0x80 ||
+      frame[6] != 0x08 || frame[7] != 0 ||
+      !(frame[10] & 0x02) || frame[12] > 7)
+    return std::nullopt;
+  const auto mpdu_bytes = static_cast<std::uint32_t>(length - 13);
+  return 500U + ((mpdu_bytes + 64U) * 80U + 64U) / 65U;
+}
+
 enum class RunState : std::uint32_t {
   Fixed = 0,
   WaitSync = 2,
