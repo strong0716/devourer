@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "AdapterCaps.h"
@@ -36,6 +37,7 @@
 #include "UsbOpen.h"
 #include "WiFiDriver.h"
 #include "logger.h"
+#include "OpenHdSingleTime.h"
 
 namespace {
 
@@ -57,6 +59,8 @@ constexpr std::uint16_t kResponse = 7;
 constexpr std::uint16_t kDeviceError = 8;
 constexpr std::uint16_t kStop = 9;
 constexpr std::uint16_t kTxError = 10;
+constexpr std::uint16_t kSingleTimeControl = 11;
+constexpr std::uint16_t kTimedControlBeacon = 12;
 constexpr std::uint16_t kCapabilityFixedRf = 1U << 0;
 constexpr std::uint16_t kCapabilityTxPowerIndex = 1U << 1;
 // Values used by Devourer's SelectedChannel::ChannelOffset.
@@ -65,6 +69,13 @@ constexpr std::uint8_t kPrimaryOffsetLower = 1;
 constexpr std::uint8_t kPrimaryOffsetUpper = 2;
 constexpr std::uint8_t kRadiotapFcs = 0x10;
 constexpr std::uint8_t kRadiotapBadFcs = 0x40;
+
+std::uint64_t monotonic_us() {
+  timespec stamp{};
+  if (::clock_gettime(CLOCK_MONOTONIC, &stamp) != 0) return 0;
+  return static_cast<std::uint64_t>(stamp.tv_sec) * 1000000ULL +
+         static_cast<std::uint64_t>(stamp.tv_nsec) / 1000ULL;
+}
 
 struct Args {
   std::string socket_path = "/run/openhd-radio.sock";
@@ -102,6 +113,11 @@ void put_i32(std::vector<std::uint8_t>& out, std::int32_t value) {
   put_u32(out, static_cast<std::uint32_t>(value));
 }
 
+void put_u64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+  put_u32(out, static_cast<std::uint32_t>(value >> 32));
+  put_u32(out, static_cast<std::uint32_t>(value));
+}
+
 bool get_u16(const std::uint8_t* data, std::size_t size,
              std::size_t& offset, std::uint16_t& value) {
   if (!data || offset > size || size - offset < 2) return false;
@@ -119,6 +135,36 @@ bool get_u32(const std::uint8_t* data, std::size_t size,
           static_cast<std::uint32_t>(data[offset + 3]);
   offset += 4;
   return true;
+}
+
+bool get_u64(const std::uint8_t* data, std::size_t size,
+             std::size_t& offset, std::uint64_t& value) {
+  std::uint32_t high = 0, low = 0;
+  if (!get_u32(data, size, offset, high) ||
+      !get_u32(data, size, offset, low)) return false;
+  value = (static_cast<std::uint64_t>(high) << 32) | low;
+  return true;
+}
+
+bool decode_single_time_plan(const std::uint8_t* data, std::size_t size,
+                             openhd_single_time::Plan& plan) {
+  std::size_t offset = 1;  // operation byte
+  if (!get_u32(data, size, offset, plan.period_us) ||
+      !get_u32(data, size, offset, plan.dwell_us) ||
+      !get_u32(data, size, offset, plan.pre_guard_us) ||
+      !get_u32(data, size, offset, plan.post_guard_us) ||
+      !get_u64(data, size, offset, plan.seed) ||
+      !get_u32(data, size, offset, plan.channel_count) ||
+      plan.channel_count > plan.frequencies_mhz.size())
+    return false;
+  for (std::uint32_t i = 0; i < plan.channel_count; ++i)
+    if (!get_u32(data, size, offset, plan.frequencies_mhz[i])) return false;
+  if (!get_u32(data, size, offset, plan.peer_timeout_us) ||
+      offset + 2 != size)
+    return false;
+  plan.own_id = data[offset++];
+  plan.flags = data[offset++];
+  return openhd_single_time::valid(plan);
 }
 
 std::vector<std::uint8_t> encode(std::uint16_t type, std::uint32_t sequence,
@@ -306,6 +352,11 @@ class RadioSession {
   bool set_fixed_rf(std::uint32_t frequency_mhz, std::uint32_t width_mhz,
                     std::uint8_t primary_channel_offset,
                     std::string& error) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    if (m_timed.configured()) {
+      error = "stop the timed executor before changing the RF profile";
+      return false;
+    }
     if (!m_radio || frequency_mhz > 0xffff ||
         (width_mhz != 20 && width_mhz != 40)) {
       error = "prototype accepts fixed 20/40 MHz RF profiles only";
@@ -369,9 +420,58 @@ class RadioSession {
   }
 
   bool send_packet(const std::uint8_t* data, std::size_t length) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    // Timed TX stays closed until the USB/NIC tail and packet class contract
+    // are proven. A socket client cannot bypass the unadvertised capability.
+    if (m_timed.configured()) return false;
     return m_radio && m_initialized && data && length &&
            m_radio->send_packet(data, length);
   }
+
+  bool timed_configure(const openhd_single_time::Plan& plan) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    if (!m_initialized || m_width_mhz != 20 ||
+        !m_timed.configure(plan, m_frequency_mhz)) return false;
+    if (!m_timed_thread.joinable()) {
+      m_timed_thread_run = true;
+      m_timed_thread = std::thread([this] { timed_loop(); });
+    }
+    return true;
+  }
+
+  bool timed_set_phase(std::uint64_t local_us, std::uint32_t phase_us) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    return m_timed.set_phase(monotonic_us(), local_us, phase_us);
+  }
+
+  bool timed_set_peer_lease(std::uint64_t received_us) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    return m_timed.set_peer_lease(monotonic_us(), received_us);
+  }
+
+  bool timed_set_members(const std::array<std::uint64_t, 4>& members) {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    return m_timed.set_members(monotonic_us(), members);
+  }
+
+  bool timed_wait_first() {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    return m_timed.wait_first();
+  }
+
+  openhd_single_time::Status timed_status() {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    auto result = m_timed.status(monotonic_us());
+    if (!result.configured) result.target_frequency_mhz = m_frequency_mhz;
+    return result;
+  }
+
+  void timed_stop() {
+    std::lock_guard<std::mutex> lock(m_timed_mutex);
+    m_timed.stop();
+  }
+
+  std::uint32_t frequency_mhz() const { return m_frequency_mhz; }
 
   void set_identity(const Args& args) {
     m_vid = args.vid;
@@ -390,6 +490,9 @@ class RadioSession {
   }
 
   void close() {
+    m_timed_thread_run = false;
+    if (m_timed_thread.joinable()) m_timed_thread.join();
+    timed_stop();
     stop_rx();
     m_radio.reset();  // quiesce USB TX while handle and context remain valid
     if (m_handle) {
@@ -419,6 +522,34 @@ class RadioSession {
   }
 
  private:
+  void timed_loop() {
+    while (m_timed_thread_run) {
+      {
+        std::lock_guard<std::mutex> lock(m_timed_mutex);
+        const auto now_us = monotonic_us();
+        const auto request = m_timed.step(now_us);
+        if (request && m_radio && m_initialized) {
+          bool success = false;
+          const auto channel = devourer::freq_to_chan(
+              static_cast<std::uint16_t>(request->frequency_mhz));
+          if (channel > 0 && channel <= 255) {
+            try {
+              m_radio->FastRetune(static_cast<std::uint8_t>(channel), true);
+              m_frequency_mhz = request->frequency_mhz;
+              success = true;
+            } catch (const std::exception& error) {
+              m_logger->error("timed retune failed: {}", error.what());
+            } catch (...) {
+              m_logger->error("timed retune failed with unknown exception");
+            }
+          }
+          m_timed.retune_complete(*request, monotonic_us(), success);
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
   void stop_rx() {
     if (m_radio && m_rx_running.load()) m_radio->StopRxLoop();
     if (m_rx_thread.joinable()) m_rx_thread.join();
@@ -452,6 +583,10 @@ class RadioSession {
   std::string m_port;
   std::uint32_t m_frequency_mhz = 0;
   std::uint32_t m_width_mhz = 0;
+  std::mutex m_timed_mutex;
+  openhd_single_time::Scheduler m_timed;
+  std::atomic<bool> m_timed_thread_run{false};
+  std::thread m_timed_thread;
 };
 
 class Service {
@@ -574,7 +709,8 @@ class Service {
   bool send_response(int fd, std::mutex& send_mutex, std::uint32_t sequence,
                      std::uint16_t request_type, std::uint16_t result_code,
                      int native_error, const std::string& detail,
-                     bool readback_verified = false) {
+                     bool readback_verified = false,
+                     const std::vector<std::uint8_t>& extra = {}) {
     const auto text_size = std::min<std::size_t>(detail.size(), 512);
     std::vector<std::uint8_t> payload;
     put_u16(payload, request_type);
@@ -584,6 +720,7 @@ class Service {
     put_u8(payload, 0);
     put_u16(payload, static_cast<std::uint16_t>(text_size));
     payload.insert(payload.end(), detail.begin(), detail.begin() + text_size);
+    payload.insert(payload.end(), extra.begin(), extra.end());
     return send_message(fd, send_mutex, kResponse, sequence, payload.data(),
                         payload.size());
   }
@@ -702,6 +839,14 @@ class Service {
         (void)send_response(client, send_mutex, message.sequence, message.type,
                             applied ? 0 : 5, applied ? 0 : EINVAL,
                             applied ? "TX power index applied" : detail);
+      } else if (message.type == kTimedControlBeacon &&
+                 message.payload_size > sizeof(std::uint32_t)) {
+        // This is the only over-air beacon allowed outside a TDMA data slot.
+        // Keep it closed with the other timed TX until RF-tail validation.
+        const std::string error = "timed beacon TX is not enabled";
+        (void)send_message(client, send_mutex, kTxError, message.sequence,
+                           reinterpret_cast<const std::uint8_t*>(error.data()),
+                           error.size(), true);
       } else if (message.type == kTxPacket &&
                  message.payload_size > sizeof(std::uint32_t)) {
         std::uint32_t tx_sequence = 0;
@@ -729,6 +874,65 @@ class Service {
           (void)send_message(client, send_mutex, kTxError, message.sequence,
                              reinterpret_cast<const std::uint8_t*>(error.data()),
                              error.size(), true);
+        }
+      } else if (message.type == kSingleTimeControl &&
+                 message.payload_size >= 1) {
+        const std::uint8_t operation = message.payload[0];
+        bool applied = false;
+        bool malformed = false;
+        std::size_t position = 1;
+        if (operation == 7 && message.payload_size == 1) {
+          const auto current = session.timed_status();
+          std::vector<std::uint8_t> status;
+          for (const std::uint32_t value :
+               {current.configured, current.synchronized, current.tx_gated,
+                current.target_frequency_mhz, current.slot,
+                static_cast<std::uint32_t>(current.state)})
+            put_u32(status, value);
+          (void)send_response(client, send_mutex, message.sequence,
+                              message.type, 0, 0, "single-time status",
+                              false, status);
+        } else {
+          openhd_single_time::Plan plan{};
+          if (operation == 1) {
+            malformed = !decode_single_time_plan(
+                message.payload, message.payload_size, plan);
+            // Deliberately reject even a valid plan until timed TX has a
+            // bounded RF tail and the OpenHD packet-class contract is wired.
+          } else if (operation == 2 && message.payload_size == 13) {
+            std::uint64_t local_us = 0;
+            std::uint32_t phase_us = 0;
+            malformed = !get_u64(message.payload, message.payload_size,
+                                 position, local_us) ||
+                        !get_u32(message.payload, message.payload_size,
+                                 position, phase_us);
+            if (!malformed) applied = session.timed_set_phase(local_us, phase_us);
+          } else if (operation == 3 && message.payload_size == 9) {
+            std::uint64_t received_us = 0;
+            malformed = !get_u64(message.payload, message.payload_size,
+                                 position, received_us);
+            if (!malformed) applied = session.timed_set_peer_lease(received_us);
+          } else if (operation == 4 && message.payload_size == 33) {
+            std::array<std::uint64_t, 4> members{};
+            for (auto& bits : members)
+              malformed |= !get_u64(message.payload, message.payload_size,
+                                    position, bits);
+            if (!malformed) applied = session.timed_set_members(members);
+          } else if (operation == 5 && message.payload_size == 1) {
+            applied = session.timed_wait_first();
+          } else if (operation == 6 && message.payload_size == 1) {
+            session.timed_stop();
+            applied = true;
+          } else {
+            malformed = true;
+          }
+          (void)send_response(
+              client, send_mutex, message.sequence, message.type,
+              malformed ? 5 : (applied ? 0 : 2),
+              malformed ? EINVAL : (applied ? 0 : ENOTSUP),
+              malformed ? "invalid single-time command" :
+                          (applied ? "single-time command applied" :
+                                     "Devourer timed executor is not enabled"));
         }
       } else if (message.type == kStop && message.payload_size == 0) {
         (void)send_response(client, send_mutex, message.sequence, message.type,

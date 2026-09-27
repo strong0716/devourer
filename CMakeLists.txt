@@ -770,6 +770,10 @@ add_executable(openhd-radio-service
 target_link_libraries(openhd-radio-service
     PRIVATE devourer PkgConfig::libusb Threads::Threads)
 
+add_executable(openhd-single-time-selftest
+    examples/openhd-radio-service/single_time_selftest.cpp)
+add_test(NAME openhd-single-time-selftest COMMAND openhd-single-time-selftest)
+
 # txpower — reference consumer of the runtime TX-power API
 # (IRadio::SetTxPowerOffsetQdb / SetTxPowerIndexOverride / GetTxPowerState /
 # GetThermalStatus): opens one adapter, steps the knobs from CLI args (no env
