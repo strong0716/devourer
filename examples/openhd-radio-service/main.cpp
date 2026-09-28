@@ -46,7 +46,7 @@ namespace {
 // by OpenHD's RadioIpcProtocol.h. The GPL-2.0 service neither includes nor
 // links OpenHD source.
 constexpr std::uint32_t kMagic = 0x4f484452;  // "OHDR"
-constexpr std::uint16_t kVersion = 2;
+constexpr std::uint16_t kVersion = 3;
 constexpr std::size_t kHeaderSize = 16;
 constexpr std::size_t kMaxPayload = 16384;
 constexpr std::size_t kMaxMessage = kHeaderSize + kMaxPayload;
@@ -1016,12 +1016,20 @@ class Service {
                          detail.size());
       return;
     }
+    // Radio clock lifetime changes on every new USB session, including a
+    // self-healed session while the service and OpenHD processes stay alive.
+    ++m_radio_generation;
+    if (m_radio_generation == 0) ++m_radio_generation;
+    const std::uint32_t radio_generation = m_radio_generation;
     session.set_rx_callback([&](const Packet& packet) {
       std::vector<std::uint8_t> payload;
-      payload.reserve(packet.Data.size() + 1);
+      payload.reserve(packet.Data.size() + 10);
       std::uint8_t flags = packet.RxAtrib.fcs_present ? kRadiotapFcs : 0;
       if (packet.RxAtrib.crc_err) flags |= kRadiotapBadFcs;
       put_u8(payload, flags);
+      put_u8(payload, session.caps().hw_rx_timestamp ? 1 : 0);
+      put_u32(payload, packet.RxAtrib.tsfl);
+      put_u32(payload, radio_generation);
       payload.insert(payload.end(), packet.Data.begin(), packet.Data.end());
       const auto rx_sequence = m_rx_sequence++;
       const bool forwarded = send_message(
@@ -1375,6 +1383,10 @@ class Service {
   bool m_bound_socket = false;
   bool m_radio_access_attempted = false;
   std::uint32_t m_rx_sequence = 1;
+  // Seed once per process, then advance for every USB session. Never use 0.
+  std::uint32_t m_radio_generation =
+      static_cast<std::uint32_t>(monotonic_us()) ^
+      static_cast<std::uint32_t>(::getpid());
   std::mutex m_stats_mutex;
   std::uint64_t m_tx_attempted = 0;
   std::uint64_t m_tx_submitted = 0;
