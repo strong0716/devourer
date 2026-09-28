@@ -35,6 +35,19 @@
  * it, and it saves five identical per-backend overrides. */
 class IRtlRadio : public IRadio {
 public:
+  struct MacTxDrainStatus {
+    std::uint16_t empty_queue_mask = 0;
+    std::uint32_t scheduler_tx_command = 0;
+  };
+
+  /* One-shot hardware state for diagnosing a failed timed retune drain.
+   * This is queried only after the bounded drain has failed; it is not a
+   * polling or monitoring interface. */
+  virtual bool ReadMacTxDrainStatus(MacTxDrainStatus& status) {
+    (void)status;
+    return false;
+  }
+
   /* Crystal (XTAL) load-capacitance trim — the CFO lever. Writes the AFE
    * crystal-cap field (a per-chip register), pulling the chip's reference
    * oscillator a few ppm to align a marginal TX/RX crystal pair; the payoff

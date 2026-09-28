@@ -113,6 +113,11 @@ enum class PoolExhaust : uint8_t {
 };
 
 struct DeviceConfig {
+  /* Internal only: stable adapter identity supplied by a long-lived radio
+   * service. Jaguar1 may reuse a validated, read-only EFUSE shadow after an
+   * in-process USB session recovery. Empty disables this cache. */
+  std::string efuse_cache_key;
+
   /* ---- RX ------------------------------------------------------------- */
   struct Rx {
     /* env: DEVOURER_RX_KEEP_CORRUPTED — pass frames that fail the 802.11 FCS

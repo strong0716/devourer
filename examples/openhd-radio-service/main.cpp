@@ -30,6 +30,7 @@
 #include "AdapterCaps.h"
 #include "ChannelFreq.h"
 #include "IRadio.h"
+#include "IRtlRadio.h"
 #include "RxPacket.h"
 #include "SelectedChannel.h"
 #include "SignalStop.h"
@@ -342,6 +343,9 @@ class RadioSession {
 
     devourer::DeviceConfig config;
     config.rx.enable_with_tx = true;
+    config.efuse_cache_key =
+        std::to_string(args.vid) + ":" + std::to_string(args.pid) + "@" +
+        std::to_string(args.bus) + "-" + args.port;
     // Match OpenHD's rtl8812au monitor injector. Radiotap NOACK still clears
     // retry count per frame; other frames use the OpenHD driver's 32 retries
     // with rate fallback disabled.
@@ -412,10 +416,21 @@ class RadioSession {
         m_radio->InitWrite(selected);
         m_initialized = true;
         m_rx_running = true;
+        m_rx_stop_requested = false;
+        m_rx_fault = false;
         m_rx_thread = std::thread([this] {
-          m_radio->StartRxLoop([this](const Packet& packet) {
-            on_rx_packet(packet);
-          });
+          try {
+            m_radio->StartRxLoop([this](const Packet& packet) {
+              on_rx_packet(packet);
+            });
+          } catch (const std::exception& exception) {
+            m_logger->error("USB RX loop failed: {}", exception.what());
+            m_rx_fault = true;
+          } catch (...) {
+            m_logger->error("USB RX loop failed with unknown exception");
+            m_rx_fault = true;
+          }
+          if (!m_rx_stop_requested.load()) m_rx_fault = true;
           m_rx_running = false;
         });
       } else {
@@ -449,14 +464,17 @@ class RadioSession {
   TxOutcome send_packet(const std::uint8_t* data, std::size_t length,
                         TxClass tx_class, std::uint32_t generation) {
     std::lock_guard<std::mutex> lock(m_timed_mutex);
-    if (!m_radio || !m_initialized || !data || !length)
+    if (!m_radio || !m_initialized || !data || !length) {
+      m_recovery_requested = true;
       return TxOutcome::Fault;
+    }
     if (m_timed_fault) return TxOutcome::Fault;
     if (!m_timed.configured()) {
       if (tx_class != TxClass::LegacyData || generation != 0)
         return TxOutcome::GateClosed;
-      return m_radio->send_packet(data, length) ? TxOutcome::Submitted
-                                                : TxOutcome::Fault;
+      if (m_radio->send_packet(data, length)) return TxOutcome::Submitted;
+      m_recovery_requested = true;
+      return TxOutcome::Fault;
     }
     if (tx_class == TxClass::LegacyData ||
         generation != m_timed_generation)
@@ -470,6 +488,7 @@ class RadioSession {
     if (!m_radio->WaitTxIdle(2000)) {
       m_logger->error("timed TX fault: USB not idle before submit");
       m_timed_fault = true;
+      m_recovery_requested = true;
       return TxOutcome::Fault;
     }
     // The same 5 ms budget covers USB completion and the remaining NIC tail.
@@ -483,6 +502,7 @@ class RadioSession {
     if (!m_radio->send_packet(data, length)) {
       m_logger->error("timed TX fault: USB submit failed");
       m_timed_fault = true;
+      m_recovery_requested = true;
       return TxOutcome::Fault;
     }
     // Hopping has a full dwell to absorb normal USB jitter; fixed TDMA has
@@ -499,6 +519,7 @@ class RadioSession {
           tx_before.failed, tx_after.failed,
           tx_after.last_error_rc, tx_after.last_was_timeout);
       m_timed_fault = true;
+      m_recovery_requested = true;
       return TxOutcome::Fault;
     }
     if (!usb_idle_on_time) {
@@ -515,6 +536,7 @@ class RadioSession {
             "timed TX fault: USB transfer did not drain safely after {} us",
             monotonic_us() - submitted_us);
         m_timed_fault = true;
+        m_recovery_requested = true;
         return TxOutcome::Fault;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(kTailReserveUs));
@@ -588,6 +610,11 @@ class RadioSession {
     // Stop and rejected replacement plans must not fall back to legacy TX.
     // A fresh client session or a successful Configure is needed to reopen TX.
     m_timed_fault = true;
+  }
+
+  bool recovery_required() {
+    if (m_recovery_requested.load() || m_rx_fault.load()) return true;
+    return false;
   }
 
   std::uint32_t frequency_mhz() const { return m_frequency_mhz; }
@@ -674,10 +701,25 @@ class RadioSession {
             }
             if (monotonic_us() - drain_wait_started_us < 100000U)
               continue;
-            m_logger->error("timed retune drain fault after 100 ms: usb_idle={} slot={} frequency={}",
-                            usb_idle, request->slot, request->frequency_mhz);
+            IRtlRadio::MacTxDrainStatus drain_status{};
+            auto* rtl_radio = dynamic_cast<IRtlRadio*>(m_radio.get());
+            if (rtl_radio && rtl_radio->ReadMacTxDrainStatus(drain_status)) {
+              m_logger->error(
+                  "timed retune drain fault after 100 ms: usb_idle={} "
+                  "slot={} frequency={} empty_queues=0x{:03x} "
+                  "scheduler_tx_command=0x{:08x}",
+                  usb_idle, request->slot, request->frequency_mhz,
+                  drain_status.empty_queue_mask,
+                  drain_status.scheduler_tx_command);
+            } else {
+              m_logger->error(
+                  "timed retune drain fault after 100 ms: usb_idle={} "
+                  "slot={} frequency={} MAC state unavailable",
+                  usb_idle, request->slot, request->frequency_mhz);
+            }
             m_timed.retune_complete(*request, monotonic_us(), false);
             m_timed_fault = true;
+            m_recovery_requested = true;
             drain_wait_started_us = 0;
             continue;
           }
@@ -694,7 +736,10 @@ class RadioSession {
             }
           }
           m_timed.retune_complete(*request, monotonic_us(), success);
-          if (!success) m_timed_fault = true;
+          if (!success) {
+            m_timed_fault = true;
+            m_recovery_requested = true;
+          }
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -702,6 +747,7 @@ class RadioSession {
   }
 
   void stop_rx() {
+    m_rx_stop_requested = true;
     if (m_radio && m_rx_running.load()) m_radio->StopRxLoop();
     if (m_rx_thread.joinable()) m_rx_thread.join();
     m_rx_running = false;
@@ -723,6 +769,9 @@ class RadioSession {
   bool m_interface_claimed = false;
   bool m_initialized = false;
   std::atomic<bool> m_rx_running{false};
+  std::atomic<bool> m_rx_stop_requested{false};
+  std::atomic<bool> m_rx_fault{false};
+  std::atomic<bool> m_recovery_requested{false};
   std::thread m_rx_thread;
   std::shared_ptr<devourer::UsbDeviceLock> m_usb_lock;
   std::unique_ptr<IRadio> m_radio;
@@ -987,6 +1036,11 @@ class Service {
     }
 
     while (!g_devourer_should_stop) {
+      if (session.recovery_required()) {
+        m_logger->error(
+            "radio session failed; recycling USB session without exiting service");
+        break;
+      }
       pollfd descriptor{client, POLLIN, 0};
       const int ready = ::poll(&descriptor, 1, 250);
       if (ready < 0) {

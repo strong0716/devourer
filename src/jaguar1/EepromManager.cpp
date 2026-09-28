@@ -9,7 +9,35 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <array>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+
+namespace {
+
+using EfuseMap = std::array<uint8_t, EFUSE_MAP_LEN_JAGUAR>;
+std::mutex g_efuse_map_cache_mutex;
+std::unordered_map<std::string, EfuseMap> g_efuse_map_cache;
+
+bool reuse_cached_efuse_map(const std::string &key, uint8_t *map) {
+  if (key.empty()) return false;
+  std::lock_guard<std::mutex> lock(g_efuse_map_cache_mutex);
+  const auto cached = g_efuse_map_cache.find(key);
+  if (cached == g_efuse_map_cache.end()) return false;
+  std::memcpy(map, cached->second.data(), cached->second.size());
+  return true;
+}
+
+void save_efuse_map(const std::string &key, const uint8_t *map) {
+  if (key.empty()) return;
+  EfuseMap cached{};
+  std::memcpy(cached.data(), map, cached.size());
+  std::lock_guard<std::mutex> lock(g_efuse_map_cache_mutex);
+  g_efuse_map_cache[key] = cached;
+}
+
+}  // namespace
 
 /* Cross-platform case-insensitive compare. POSIX has `strcasecmp` in
  * <strings.h>; MSVC has `_stricmp`; doing it by hand keeps the include
@@ -33,6 +61,15 @@ EepromManager::EepromManager(RtlAdapter device, Logger_t logger,
   read_chip_version_8812a(device);
   timer.stage("chip_version");
 
+  const std::string efuse_cache_key =
+      cfg.efuse_cache_key.empty()
+          ? std::string{}
+          : cfg.efuse_cache_key + ":chip=" +
+                std::to_string(static_cast<unsigned>(version_id.ICType));
+  const bool efuse_cache_hit =
+      version_id.ICType != CHIP_8814A &&
+      reuse_cached_efuse_map(efuse_cache_key, efuse_eeprom_data);
+
   /* On 8814AU, defer all EFUSE access until AFTER firmware download. rtw88's
    * usbmon shows zero touches to EFUSE_CTRL (0x0031-0x0033) and EFUSE_ACCESS
    * (0x00CF) before fwdl — these are post-fw-boot operations. Reading EFUSE
@@ -45,12 +82,20 @@ EepromManager::EepromManager(RtlAdapter device, Logger_t logger,
   if (version_id.ICType == CHIP_8814A) {
     std::memset(efuse_eeprom_data, 0xFF, sizeof(efuse_eeprom_data));
     _device.AutoloadFailFlag = true;
+  } else if (efuse_cache_hit) {
+    _logger->info("reusing validated EFUSE shadow for USB session recovery");
   } else {
     hal_InitPGData_8812A();
   }
   timer.stage("efuse_read");
 
   Hal_EfuseParseIDCode8812A();
+  if (!efuse_cache_hit && version_id.ICType != CHIP_8814A &&
+      !_device.AutoloadFailFlag && IsEfuseTxPowerInfoValid(efuse_eeprom_data)) {
+    save_efuse_map(efuse_cache_key, efuse_eeprom_data);
+    if (!efuse_cache_key.empty())
+      _logger->info("validated EFUSE shadow cached for USB session recovery");
+  }
   EEPROMVersion = Hal_ReadPROMVersion8812A(_device, efuse_eeprom_data);
   EEPROMRegulatory = Hal_ReadTxPowerInfo8812A(_device, efuse_eeprom_data);
   /* T1: populate the per-channel per-path TX-power tables from EFUSE so

@@ -857,6 +857,17 @@ bool RtlJaguarDevice::WaitMacTxIdle(unsigned timeout_us) {
   return false;
 }
 
+bool RtlJaguarDevice::ReadMacTxDrainStatus(MacTxDrainStatus& status) {
+  try {
+    status.empty_queue_mask =
+        _device.rtw_read<std::uint16_t>(0x041a) & 0x0fff;
+    status.scheduler_tx_command = _device.rtw_read<std::uint32_t>(0x05f8);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool RtlJaguarDevice::send_packet(const uint8_t *packet, size_t length) {
   /* Build one TXDMA block (40-byte descriptor + frame, build_tx_block) and
    * submit it as one async bulk-OUT. */
